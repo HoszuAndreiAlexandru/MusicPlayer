@@ -3983,6 +3983,7 @@ MainWindow::MainWindow(QWidget *parent)
         }
     });
     nowPlayingPanelLayout->addWidget(nowPlayingPanelTrackTitleLabel_);
+    nowPlayingPanelLayout->addSpacing(16);
 
     auto *artistInfoCard = new QFrame(nowPlayingPanel_);
     artistInfoCard->setObjectName(QStringLiteral("artistInfoCard"));
