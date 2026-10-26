@@ -144,6 +144,7 @@ public:
     using PlaylistsHandler = std::function<void(const QList<SpotifyPlaylistResult> &, const QString &)>;
     using LibraryItemsHandler = std::function<void(const QList<SpotifyLibraryItem> &,
                                                    const QString &)>;
+    using SavedTracksChangeHandler = std::function<void(bool, const QString &)>;
     using TracksPageHandler = std::function<void(const QList<SpotifyTrackResult> &, int, int,
                                                  const QString &)>;
     using PlaybackStateHandler = std::function<void(const SpotifyPlaybackState &)>;
@@ -185,6 +186,8 @@ public:
     void searchCatalog(const QString &query, SearchHandler handler);
     void fetchCurrentUserPlaylists(PlaylistsHandler handler, bool forceNetwork = false);
     void fetchCurrentUserLibraryItems(LibraryItemsHandler handler, bool forceNetwork = false);
+    void checkSavedTracksChanged(const QString &currentTrackUri,
+                                 SavedTracksChangeHandler handler);
     void fetchSavedTracks(int offset, TracksPageHandler handler, bool forceNetwork = false);
     void fetchPlaylistTracks(const QString &playlistId, int offset, TracksPageHandler handler,
                              bool forceNetwork = false);
@@ -243,6 +246,10 @@ private:
     QString trackPageCachePath(const QString &cacheKey) const;
     bool loadTrackPageFromDisk(const QString &cacheKey, CachedTrackPage *page) const;
     void saveTrackPageToDisk(const QString &cacheKey, const CachedTrackPage &page) const;
+    QString libraryItemsCachePath() const;
+    bool loadLibraryItemsCache(QList<SpotifyLibraryItem> *items) const;
+    void saveLibraryItemsCache(const QList<SpotifyLibraryItem> &items) const;
+    void invalidateSavedTracksPageCache();
     QString metadataCachePath(const QString &cacheKey) const;
     bool loadMetadataFromDisk(const QString &cacheKey, QJsonObject *value,
                               qint64 *expiresAtMs) const;

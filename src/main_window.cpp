@@ -3956,7 +3956,7 @@ MainWindow::MainWindow(QWidget *parent)
     connect(libraryRefreshButton_, &QPushButton::clicked, this, [this] {
         spotifyConnection_->invalidateLibraryCache();
         refreshPlaylistSidebar(true);
-        loadLibraryTracks(0, false, true);
+        loadLibraryTracks(0, false, true, true);
     });
     const auto installTrackContextMenu = [this](QTableView *table, TrackTableModel *model) {
         table->viewport()->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -5224,7 +5224,24 @@ void MainWindow::updateSpotifyConnectionUi(const QString &message, bool connecte
         }
         libraryLoadedForSession_ = true;
         refreshPlaylistSidebar();
-        loadLibraryTracks(0, false);
+        const bool loadLibraryOnConnect = pageStack_->currentIndex() == libraryPageIndex;
+        if (loadLibraryOnConnect && !activeLibraryPlaylistId_.isEmpty()) {
+            loadLibraryTracks(0, false);
+        }
+        const quint64 libraryRequestId = libraryRequestId_;
+        const QString currentTrackUri = playbackState_.active
+            ? playbackState_.trackUri : QString{};
+        spotifyConnection_->checkSavedTracksChanged(
+            currentTrackUri, [this, loadLibraryOnConnect, libraryRequestId](
+                                 bool changed, const QString &) {
+                if (!loadLibraryOnConnect || !spotifyConnection_->isConnected()
+                    || pageStack_->currentIndex() != libraryPageIndex
+                    || libraryRequestId_ != libraryRequestId
+                    || !activeLibraryPlaylistId_.isEmpty()) {
+                    return;
+                }
+                loadLibraryTracks(0, false, changed, false);
+            });
         if (pageStack_->currentIndex() == searchPageIndex
             && !searchEdit_->text().trimmed().isEmpty()) {
             performSearch();
@@ -5760,7 +5777,8 @@ void MainWindow::showPlaylist(const QString &playlistId, const QString &playlist
     loadLibraryTracks(0, false);
 }
 
-void MainWindow::loadLibraryTracks(int offset, bool append, bool forceNetwork)
+void MainWindow::loadLibraryTracks(int offset, bool append, bool forceNetwork,
+                                   bool scanAllPages)
 {
     if (!spotifyConnection_->isConnected()) {
         librarySummaryText_ = QStringLiteral("Connect Spotify to load your music.");
@@ -5777,7 +5795,8 @@ void MainWindow::loadLibraryTracks(int offset, bool append, bool forceNetwork)
         libraryTotalTracks_ = 0;
         libraryTotalDurationMs_ = 0;
         libraryPageDurations_.clear();
-        librarySummaryScanActive_ = true;
+        librarySummaryScanActive_ = scanAllPages;
+        libraryForceRefreshActive_ = scanAllPages && forceNetwork;
         libraryTracksModel_->clearRows();
         updateLibraryArtwork();
         libraryBusy_ = false;
@@ -5792,7 +5811,7 @@ void MainWindow::requestLibraryRange(int firstRow, bool forceNetwork)
     }
 
     constexpr int spotifyPageSize = 50;
-    constexpr int prefetchBatchSize = 500;
+    const int prefetchBatchSize = librarySummaryScanActive_ ? 500 : spotifyPageSize;
     firstRow = qMax(0, firstRow);
     const int batchStart = (firstRow / prefetchBatchSize) * prefetchBatchSize;
     const int batchEnd = libraryTotalTracks_ > 0
@@ -5810,7 +5829,7 @@ void MainWindow::requestLibraryRange(int firstRow, bool forceNetwork)
         forceNetworkLibraryPageOffsets_.clear();
     }
 
-    if (forceNetwork) {
+    if (forceNetwork || libraryForceRefreshActive_) {
         for (int offset = batchStart; offset < batchEnd; offset += spotifyPageSize) {
             forceNetworkLibraryPageOffsets_.insert(offset);
         }
@@ -5851,11 +5870,12 @@ void MainWindow::processNextLibraryPage()
                 }
             }
             if (nextMissingOffset >= 0) {
-                requestLibraryRange(nextMissingOffset);
+                requestLibraryRange(nextMissingOffset, libraryForceRefreshActive_);
                 return;
             }
         }
         librarySummaryScanActive_ = false;
+        libraryForceRefreshActive_ = false;
         updateLibraryStatus();
         tryFocusPlaybackTrack();
         return;
@@ -5883,6 +5903,7 @@ void MainWindow::processNextLibraryPage()
                 pendingLibraryPageOffsets_.clear();
                 libraryBusy_ = false;
                 librarySummaryScanActive_ = false;
+                libraryForceRefreshActive_ = false;
                 if (pendingLibraryFocusPlaylistId_ == activeLibraryPlaylistId_) {
                     pendingLibraryFocusTrackUri_.clear();
                     pendingLibraryFocusPlaylistId_.clear();
@@ -5974,6 +5995,13 @@ void MainWindow::updateLibraryStatus()
         .arg(libraryTotalTracks_ == 1 ? QStringLiteral("track") : QStringLiteral("tracks"));
     if (librarySummaryScanActive_ || libraryBusy_ || !pendingLibraryPageOffsets_.isEmpty()) {
         librarySummaryText_ = trackCount + QStringLiteral(" · Calculating total time…");
+        updateLibraryHeader();
+        return;
+    }
+
+    const int expectedPageCount = (libraryTotalTracks_ + 49) / 50;
+    if (libraryPageDurations_.size() < expectedPageCount) {
+        librarySummaryText_ = trackCount + QStringLiteral(" · Total time fills in as you browse");
         updateLibraryHeader();
         return;
     }

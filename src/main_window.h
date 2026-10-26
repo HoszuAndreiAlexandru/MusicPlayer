@@ -75,7 +75,8 @@ private:
     void updateHistoryButtons();
     void filterPlaylists(const QString &query);
     void performSearch();
-    void loadLibraryTracks(int offset, bool append, bool forceNetwork = false);
+    void loadLibraryTracks(int offset, bool append, bool forceNetwork = false,
+                           bool scanAllPages = false);
     void requestLibraryRange(int firstRow, bool forceNetwork = false);
     void processNextLibraryPage();
     void updateLibraryStatus();
@@ -284,6 +285,7 @@ private:
     bool libraryBusy_ = false;
     bool libraryLoadedForSession_ = false;
     bool librarySummaryScanActive_ = false;
+    bool libraryForceRefreshActive_ = false;
     bool startupWindowPending_ = false;
     bool playbackSeekPending_ = false;
     bool restoringNavigation_ = false;

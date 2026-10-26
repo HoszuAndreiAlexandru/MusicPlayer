@@ -54,7 +54,6 @@ constexpr qint64 spotifyLyricsCacheLifetimeMs = 365LL * 24 * 60 * 60 * 1000;
 constexpr qint64 spotifyMissingLyricsCacheLifetimeMs = 7LL * 24 * 60 * 60 * 1000;
 constexpr qint64 spotifyTrackPageRetryDelayMs = 30LL * 60 * 1000;
 constexpr qint64 maxTrackPageCacheBytes = 64LL * 1024 * 1024;
-constexpr int maximumLyricsCacheEntries = 2000;
 constexpr int spotifyRequestTimeoutMs = 20000;
 constexpr int spotifyImageRequestTimeoutMs = 30000;
 constexpr int playbackStartupTimeoutMs = 25000;
@@ -1335,10 +1334,7 @@ bool SpotifyConnection::isConnected() const
 
 void SpotifyConnection::invalidateLibraryCache()
 {
-    trackPageCache_.clear();
-    if (httpCache_) {
-        httpCache_->clear();
-    }
+    QFile::remove(libraryItemsCachePath());
 }
 
 void SpotifyConnection::searchCatalog(const QString &searchText, SearchHandler handler)
@@ -1729,17 +1725,6 @@ void SpotifyConnection::saveLyricsCache()
         }
     }
 
-    if (lyricsCache_.size() > maximumLyricsCacheEntries) {
-        QStringList keys = lyricsCache_.keys();
-        std::sort(keys.begin(), keys.end(), [this](const QString &left, const QString &right) {
-            return lyricsCache_.value(left).cachedAtMs < lyricsCache_.value(right).cachedAtMs;
-        });
-        const int excess = lyricsCache_.size() - maximumLyricsCacheEntries;
-        for (int index = 0; index < excess; ++index) {
-            lyricsCache_.remove(keys.at(index));
-        }
-    }
-
     const QString path = lyricsCachePath();
     if (path.isEmpty() || !QDir().mkpath(QFileInfo(path).absolutePath())) {
         return;
@@ -1854,6 +1839,7 @@ void SpotifyConnection::saveTrackPageToDisk(const QString &cacheKey,
     }
 
     QJsonObject root;
+    root.insert(QStringLiteral("cache_key"), cacheKey);
     root.insert(QStringLiteral("expires_at_ms"), static_cast<double>(page.expiresAtMs));
     root.insert(QStringLiteral("retry_after_ms"), static_cast<double>(page.retryAfterMs));
     root.insert(QStringLiteral("next_offset"), page.nextOffset);
@@ -1892,6 +1878,130 @@ void SpotifyConnection::saveTrackPageToDisk(const QString &cacheKey,
     }
 }
 
+QString SpotifyConnection::libraryItemsCachePath() const
+{
+    const QString cacheBase = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+    return cacheBase.isEmpty() ? QString{} : QDir(cacheBase).filePath(
+        QStringLiteral("spotify-library-items.json"));
+}
+
+bool SpotifyConnection::loadLibraryItemsCache(QList<SpotifyLibraryItem> *items) const
+{
+    if (!items) return false;
+    QFile file(libraryItemsCachePath());
+    if (!file.open(QIODevice::ReadOnly)) return false;
+    const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
+    if (!document.isObject() || !document.object().value(QStringLiteral("complete")).toBool()) {
+        return false;
+    }
+
+    QList<SpotifyLibraryItem> cachedItems;
+    const QJsonArray values = document.object().value(QStringLiteral("items")).toArray();
+    cachedItems.reserve(values.size());
+    for (const QJsonValue &value : values) {
+        const QJsonObject object = value.toObject();
+        SpotifyLibraryItem item;
+        item.type = static_cast<SpotifyLibraryItemType>(
+            object.value(QStringLiteral("type")).toInt());
+        item.id = object.value(QStringLiteral("id")).toString();
+        item.name = object.value(QStringLiteral("name")).toString();
+        item.creator = object.value(QStringLiteral("creator")).toString();
+        item.category = object.value(QStringLiteral("category")).toString();
+        item.imageUrl = object.value(QStringLiteral("image_url")).toString();
+        item.spotifyUri = object.value(QStringLiteral("uri")).toString();
+        item.spotifyUrl = object.value(QStringLiteral("url")).toString();
+        item.itemCount = object.value(QStringLiteral("item_count")).toInt();
+        item.durationMs = object.value(QStringLiteral("duration_ms")).toInt();
+        if (!item.id.isEmpty() && !item.name.isEmpty()) {
+            cachedItems.append(std::move(item));
+        }
+    }
+    *items = std::move(cachedItems);
+    return true;
+}
+
+void SpotifyConnection::saveLibraryItemsCache(const QList<SpotifyLibraryItem> &items) const
+{
+    const QString path = libraryItemsCachePath();
+    if (path.isEmpty() || !QDir().mkpath(QFileInfo(path).absolutePath())) return;
+
+    QJsonArray values;
+    for (const SpotifyLibraryItem &item : items) {
+        QJsonObject object;
+        object.insert(QStringLiteral("type"), static_cast<int>(item.type));
+        object.insert(QStringLiteral("id"), item.id);
+        object.insert(QStringLiteral("name"), item.name);
+        object.insert(QStringLiteral("creator"), item.creator);
+        object.insert(QStringLiteral("category"), item.category);
+        object.insert(QStringLiteral("image_url"), item.imageUrl);
+        object.insert(QStringLiteral("uri"), item.spotifyUri);
+        object.insert(QStringLiteral("url"), item.spotifyUrl);
+        object.insert(QStringLiteral("item_count"), item.itemCount);
+        object.insert(QStringLiteral("duration_ms"), item.durationMs);
+        values.append(object);
+    }
+
+    QJsonObject root;
+    root.insert(QStringLiteral("version"), 1);
+    root.insert(QStringLiteral("complete"), true);
+    root.insert(QStringLiteral("items"), values);
+    QSaveFile file(path);
+    if (file.open(QIODevice::WriteOnly)) {
+        file.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+        file.commit();
+    }
+}
+
+void SpotifyConnection::invalidateSavedTracksPageCache()
+{
+    QSet<QString> savedTrackCacheKeys;
+    for (auto entry = trackPageCache_.begin(); entry != trackPageCache_.end();) {
+        if (entry.key().contains(QStringLiteral("/me/tracks?"))) {
+            savedTrackCacheKeys.insert(entry.key());
+            QFile::remove(trackPageCachePath(entry.key()));
+            entry = trackPageCache_.erase(entry);
+        } else {
+            ++entry;
+        }
+    }
+
+    const QString cacheBase = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+    QDir directory(QDir(cacheBase).filePath(QStringLiteral("spotify-track-pages")));
+    for (const QFileInfo &entry : directory.entryInfoList(
+             {QStringLiteral("*.json")}, QDir::Files)) {
+        QFile file(entry.absoluteFilePath());
+        if (!file.open(QIODevice::ReadOnly)) continue;
+        const QJsonObject root = QJsonDocument::fromJson(file.readAll()).object();
+        file.close();
+        QString cacheKey = root.value(QStringLiteral("cache_key")).toString();
+        if (cacheKey.isEmpty()) {
+            const int offset = root.value(QStringLiteral("next_offset")).toInt()
+                - root.value(QStringLiteral("tracks")).toArray().size();
+            if (offset >= 0) {
+                QUrl pageUrl(QStringLiteral("https://api.spotify.com/v1/me/tracks"));
+                QUrlQuery query;
+                query.addQueryItem(QStringLiteral("limit"), QStringLiteral("50"));
+                query.addQueryItem(QStringLiteral("offset"), QString::number(offset));
+                pageUrl.setQuery(query);
+                const QString candidate = pageUrl.toString(QUrl::FullyEncoded);
+                if (QDir::cleanPath(trackPageCachePath(candidate)).compare(
+                        QDir::cleanPath(entry.absoluteFilePath()), Qt::CaseInsensitive) == 0) {
+                    cacheKey = candidate;
+                }
+            }
+        }
+        if (!cacheKey.contains(QStringLiteral("/me/tracks?"))) continue;
+
+        savedTrackCacheKeys.insert(cacheKey);
+        QFile::remove(entry.absoluteFilePath());
+    }
+    if (httpCache_) {
+        for (const QString &cacheKey : std::as_const(savedTrackCacheKeys)) {
+            httpCache_->remove(QUrl(cacheKey));
+        }
+    }
+}
+
 void SpotifyConnection::fetchCurrentUserPlaylists(PlaylistsHandler handler, bool forceNetwork)
 {
     if (!connected_ || accessToken_.isEmpty()) {
@@ -1916,6 +2026,16 @@ void SpotifyConnection::fetchCurrentUserLibraryItems(LibraryItemsHandler handler
         handler({}, apiRateLimitMessage());
         return;
     }
+    if (!forceNetwork) {
+        QList<SpotifyLibraryItem> cachedItems;
+        if (loadLibraryItemsCache(&cachedItems)) {
+            QTimer::singleShot(0, this,
+                               [handler = std::move(handler), cachedItems]() mutable {
+                handler(cachedItems, {});
+            });
+            return;
+        }
+    }
 
     struct Aggregate
     {
@@ -1926,14 +2046,17 @@ void SpotifyConnection::fetchCurrentUserLibraryItems(LibraryItemsHandler handler
     };
     auto aggregate = std::make_shared<Aggregate>();
     aggregate->handler = std::move(handler);
-    const auto collect = [aggregate](const QList<SpotifyLibraryItem> &items,
-                                     const QString &error) {
+    const auto collect = [this, aggregate](const QList<SpotifyLibraryItem> &items,
+                                           const QString &error) {
         aggregate->items.append(items);
         if (!error.isEmpty()) {
             aggregate->errors.append(error);
         }
         if (--aggregate->remaining == 0 && aggregate->handler) {
             auto completion = std::move(aggregate->handler);
+            if (aggregate->errors.isEmpty()) {
+                saveLibraryItemsCache(aggregate->items);
+            }
             completion(aggregate->items, aggregate->errors.join(QStringLiteral("\n")));
         }
     };
@@ -1946,6 +2069,197 @@ void SpotifyConnection::fetchCurrentUserLibraryItems(LibraryItemsHandler handler
                          0, {}, collect, forceNetwork);
     fetchLibraryItemPage(QStringLiteral("me/shows"), SpotifyLibraryItemType::Show,
                          0, {}, collect, forceNetwork);
+}
+
+void SpotifyConnection::checkSavedTracksChanged(const QString &currentTrackUri,
+                                                SavedTracksChangeHandler handler)
+{
+    if (!connected_ || accessToken_.isEmpty()) {
+        if (handler) handler(false, QStringLiteral("Connect Spotify before checking saved tracks."));
+        return;
+    }
+    if (apiRateLimitActive()) {
+        if (handler) handler(false, apiRateLimitMessage());
+        return;
+    }
+
+    constexpr int spotifyPageSize = 50;
+    constexpr int sampleDistance = 20;
+    const auto pageKeyForOffset = [](int offset) {
+        QUrl pageUrl(QStringLiteral("https://api.spotify.com/v1/me/tracks"));
+        QUrlQuery query;
+        query.addQueryItem(QStringLiteral("limit"), QString::number(spotifyPageSize));
+        query.addQueryItem(QStringLiteral("offset"), QString::number(offset));
+        pageUrl.setQuery(query);
+        return pageUrl.toString(QUrl::FullyEncoded);
+    };
+    const auto loadCachedPage = [this, &pageKeyForOffset](int offset,
+                                                          CachedTrackPage *page) {
+        if (!page) return false;
+        const QString cacheKey = pageKeyForOffset((offset / spotifyPageSize) * spotifyPageSize);
+        const auto cached = trackPageCache_.constFind(cacheKey);
+        if (cached != trackPageCache_.cend()) {
+            *page = cached.value();
+            return true;
+        }
+        return loadTrackPageFromDisk(cacheKey, page);
+    };
+
+    CachedTrackPage firstPage;
+    if (!loadCachedPage(0, &firstPage)) {
+        // Without a local baseline, the visible page load will fetch only what is needed.
+        if (handler) handler(false, {});
+        return;
+    }
+
+    const int cachedTotal = qMax(0, firstPage.total);
+    int anchorOffset = 0;
+    if (!currentTrackUri.isEmpty()) {
+        for (int pageOffset = 0; pageOffset < cachedTotal; pageOffset += spotifyPageSize) {
+            CachedTrackPage page;
+            if (!loadCachedPage(pageOffset, &page)) continue;
+            for (int index = 0; index < page.tracks.size(); ++index) {
+                if (page.tracks.at(index).spotifyUri == currentTrackUri) {
+                    anchorOffset = pageOffset + index;
+                    pageOffset = cachedTotal;
+                    break;
+                }
+            }
+        }
+    }
+
+    QList<int> sampleOffsets;
+    if (cachedTotal > 0) {
+        sampleOffsets.append(anchorOffset);
+        if (anchorOffset >= sampleDistance) sampleOffsets.append(anchorOffset - sampleDistance);
+        if (anchorOffset + sampleDistance < cachedTotal) {
+            sampleOffsets.append(anchorOffset + sampleDistance);
+        }
+        std::sort(sampleOffsets.begin(), sampleOffsets.end());
+        sampleOffsets.erase(std::unique(sampleOffsets.begin(), sampleOffsets.end()),
+                            sampleOffsets.end());
+    }
+
+    QHash<int, QPair<QString, QString>> cachedSamples;
+    for (const int sampleOffset : std::as_const(sampleOffsets)) {
+        CachedTrackPage page;
+        if (!loadCachedPage(sampleOffset, &page)) {
+            // An uncached sample cannot establish that the saved list is unchanged.
+            if (handler) handler(false, {});
+            return;
+        }
+        if (page.total != cachedTotal) {
+            invalidateSavedTracksPageCache();
+            if (handler) handler(true, {});
+            return;
+        }
+        const int pageIndex = sampleOffset % spotifyPageSize;
+        if (pageIndex < 0 || pageIndex >= page.tracks.size()) {
+            if (handler) handler(false, {});
+            return;
+        }
+        const SpotifyTrackResult &track = page.tracks.at(pageIndex);
+        cachedSamples.insert(sampleOffset, {track.spotifyUri, track.addedAt});
+    }
+
+    const int requestOffset = sampleOffsets.isEmpty() ? 0 : sampleOffsets.first();
+    const int requestEnd = sampleOffsets.isEmpty() ? 0 : sampleOffsets.last();
+    const int requestLimit = sampleOffsets.isEmpty()
+        ? 1 : requestEnd - requestOffset + 1;
+
+    const auto renewCachedSavedPages = [this, pageKeyForOffset](qint64 expiresAtMs,
+                                                                qint64 retryAfterMs) {
+        for (auto page = trackPageCache_.begin(); page != trackPageCache_.end(); ++page) {
+            if (!page.key().contains(QStringLiteral("/me/tracks?"))) continue;
+            page->expiresAtMs = expiresAtMs;
+            page->retryAfterMs = retryAfterMs;
+        }
+
+        const QString cacheBase = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+        QDir directory(QDir(cacheBase).filePath(QStringLiteral("spotify-track-pages")));
+        for (const QFileInfo &entry : directory.entryInfoList(
+                 {QStringLiteral("*.json")}, QDir::Files)) {
+            QFile file(entry.absoluteFilePath());
+            if (!file.open(QIODevice::ReadOnly)) continue;
+            QJsonObject root = QJsonDocument::fromJson(file.readAll()).object();
+            file.close();
+            QString cacheKey = root.value(QStringLiteral("cache_key")).toString();
+            if (cacheKey.isEmpty()) {
+                const int offset = root.value(QStringLiteral("next_offset")).toInt()
+                    - root.value(QStringLiteral("tracks")).toArray().size();
+                if (offset >= 0) {
+                    const QString candidate = pageKeyForOffset(offset);
+                    if (QDir::cleanPath(trackPageCachePath(candidate)).compare(
+                            QDir::cleanPath(entry.absoluteFilePath()),
+                            Qt::CaseInsensitive) == 0) {
+                        cacheKey = candidate;
+                    }
+                }
+            }
+            if (!cacheKey.contains(QStringLiteral("/me/tracks?"))) {
+                continue;
+            }
+            root.insert(QStringLiteral("cache_key"), cacheKey);
+            root.insert(QStringLiteral("expires_at_ms"), static_cast<double>(expiresAtMs));
+            root.insert(QStringLiteral("retry_after_ms"), static_cast<double>(retryAfterMs));
+            QSaveFile updatedFile(entry.absoluteFilePath());
+            if (updatedFile.open(QIODevice::WriteOnly)) {
+                updatedFile.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+                updatedFile.commit();
+            }
+        }
+    };
+
+    QUrl url(QStringLiteral("https://api.spotify.com/v1/me/tracks"));
+    QUrlQuery query;
+    query.addQueryItem(QStringLiteral("limit"), QString::number(requestLimit));
+    query.addQueryItem(QStringLiteral("offset"), QString::number(requestOffset));
+    url.setQuery(query);
+    QNetworkReply *reply = authenticatedGet(url, false, true);
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, cachedTotal, cachedSamples, requestOffset,
+             renewCachedSavedPages,
+             handler = std::move(handler)]() mutable {
+        const int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QJsonObject response = QJsonDocument::fromJson(reply->readAll()).object();
+        if (reply->error() != QNetworkReply::NoError || statusCode < 200 || statusCode >= 300) {
+            const QString error = apiFailureMessage(reply, response);
+            reply->deleteLater();
+            const qint64 retryAfterMs = QDateTime::currentMSecsSinceEpoch()
+                + spotifyTrackPageRetryDelayMs;
+            renewCachedSavedPages(retryAfterMs, retryAfterMs);
+            if (handler) handler(false, error);
+            return;
+        }
+
+        const int remoteTotal = qMax(0, response.value(QStringLiteral("total")).toInt());
+        const QJsonArray items = response.value(QStringLiteral("items")).toArray();
+        bool changed = cachedTotal != remoteTotal;
+        for (auto sample = cachedSamples.cbegin(); sample != cachedSamples.cend(); ++sample) {
+            const int itemIndex = sample.key() - requestOffset;
+            if (itemIndex < 0 || itemIndex >= items.size()) {
+                changed = true;
+                continue;
+            }
+            const QJsonObject savedItem = items.at(itemIndex).toObject();
+            QJsonObject track = savedItem.value(QStringLiteral("item")).toObject();
+            if (track.isEmpty()) track = savedItem.value(QStringLiteral("track")).toObject();
+            const QString remoteUri = track.value(QStringLiteral("uri")).toString();
+            const QString remoteAddedAt = savedItem.value(QStringLiteral("added_at")).toString();
+            if (sample.value().first != remoteUri || sample.value().second != remoteAddedAt) {
+                changed = true;
+            }
+        }
+        if (changed) {
+            invalidateSavedTracksPageCache();
+        } else {
+            renewCachedSavedPages(QDateTime::currentMSecsSinceEpoch()
+                                      + spotifyTrackPageCacheLifetimeMs,
+                                  0);
+        }
+        reply->deleteLater();
+        if (handler) handler(changed, {});
+    });
 }
 
 void SpotifyConnection::fetchLibraryItemPage(const QString &endpoint,
@@ -2808,6 +3122,9 @@ void SpotifyConnection::clearApiCache()
     }
     const QString cacheBase = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
     if (!cacheBase.isEmpty()) {
+        QFile::remove(libraryItemsCachePath());
+        QFile::remove(QDir(cacheBase).filePath(
+            QStringLiteral("spotify-saved-tracks-check.json")));
         QDir trackPagesDirectory(QDir(cacheBase).filePath(QStringLiteral("spotify-track-pages")));
         if (trackPagesDirectory.exists()) {
             trackPagesDirectory.removeRecursively();
