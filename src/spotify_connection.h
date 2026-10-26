@@ -292,6 +292,7 @@ private:
     qint64 lastDevicesRefreshMs_ = 0;
     qint64 apiRateLimitUntilMs_ = 0;
     qint64 lastApiRateLimitMs_ = 0;
+    int preferredPlaybackVolumePercent_ = 25;
     int consecutiveApiRateLimits_ = 0;
     bool apiPlaybackStateKnown_ = false;
     bool playbackPollInFlight_ = false;

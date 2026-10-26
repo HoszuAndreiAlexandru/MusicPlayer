@@ -3637,6 +3637,8 @@ MainWindow::MainWindow(QWidget *parent)
     new HoverScrollBarBehavior(albumTracksTable_);
 
     QSettings appSettings;
+    const int savedPlaybackVolumeSliderPosition = qBound(
+        0, appSettings.value(QStringLiteral("playback/volumeSliderPosition"), 50).toInt(), 100);
     spotifyClientIdEdit_->setText(appSettings.value("spotify/clientId").toString());
     imageCacheSizeEdit_->setValue(appSettings.value("cache/imageMaxMb", 10240).toInt());
     playlistFilterEdit_->setText(
@@ -3736,6 +3738,8 @@ MainWindow::MainWindow(QWidget *parent)
     });
 
     spotifyConnection_ = new SpotifyConnection(this);
+    spotifyConnection_->setPlaybackVolume(
+        volumeSliderPositionToPercent(savedPlaybackVolumeSliderPosition));
     spotifyConnection_->setImageCacheMaxSizeMb(imageCacheSizeEdit_->value());
     connect(imageCacheSizeEdit_, &QSpinBox::valueChanged, this, [this](int megabytes) {
         QSettings settings;
@@ -4217,7 +4221,10 @@ MainWindow::MainWindow(QWidget *parent)
     playbackVolumeSlider_ = new ClickToSetSlider(Qt::Horizontal, playerBar);
     playbackVolumeSlider_->setObjectName(QStringLiteral("playbackVolumeSlider"));
     playbackVolumeSlider_->setRange(0, 100);
-    playbackVolumeSlider_->setValue(50);
+    playbackVolumeSlider_->setValue(savedPlaybackVolumeSliderPosition);
+    if (savedPlaybackVolumeSliderPosition > 0) {
+        lastNonZeroVolume_ = savedPlaybackVolumeSliderPosition;
+    }
     playbackVolumeSlider_->setEnabled(false);
     playbackVolumeSlider_->setMouseTracking(true);
     playbackVolumeSlider_->setAttribute(Qt::WA_Hover, true);
@@ -4353,7 +4360,16 @@ MainWindow::MainWindow(QWidget *parent)
                                                     : QStringLiteral("Mute"));
         volumeMuteButton_->setToolTip(muted ? QStringLiteral("Unmute")
                                             : QStringLiteral("Mute"));
+        if (!playbackVolumeSlider_->isSliderDown()) {
+            QSettings settings;
+            settings.setValue(QStringLiteral("playback/volumeSliderPosition"), volume);
+        }
         spotifyConnection_->setPlaybackVolume(volumeSliderPositionToPercent(volume));
+    });
+    connect(playbackVolumeSlider_, &QSlider::sliderReleased, this, [this] {
+        QSettings settings;
+        settings.setValue(QStringLiteral("playback/volumeSliderPosition"),
+                          playbackVolumeSlider_->value());
     });
     connect(volumeMuteButton_, &QToolButton::clicked, this, [this] {
         if (playbackVolumeSlider_->value() == 0) {

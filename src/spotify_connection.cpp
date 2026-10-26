@@ -404,7 +404,7 @@ QString findHeadlessChromium()
     return {};
 }
 
-QByteArray playbackPageHtml()
+QByteArray playbackPageHtml(int initialVolumePercent)
 {
     static constexpr char html[] = R"HTML(<!doctype html>
 <html lang="en">
@@ -538,7 +538,7 @@ QByteArray playbackPageHtml()
     window.onSpotifyWebPlaybackSDKReady = () => {
       player = new Spotify.Player({
         name: 'MusicPlayer',
-        volume: 0.5,
+        volume: __INITIAL_VOLUME_PERCENT__ / 100,
         // Keep the player independent from Chrome's media-session audio focus.
         enableMediaSession: false,
         getOAuthToken: async callback => {
@@ -623,7 +623,10 @@ QByteArray playbackPageHtml()
   </script>
 </body>
 </html>)HTML";
-    return QByteArray(html);
+    QByteArray page(html);
+    page.replace(QByteArrayLiteral("__INITIAL_VOLUME_PERCENT__"),
+                 QByteArray::number(qBound(0, initialVolumePercent, 100)));
+    return page;
 }
 
 } // namespace
@@ -1056,11 +1059,13 @@ void SpotifyConnection::seekPlayback(int positionMs)
 
 void SpotifyConnection::setPlaybackVolume(int volumePercent)
 {
+    const int boundedVolume = qBound(0, volumePercent, 100);
+    preferredPlaybackVolumePercent_ = boundedVolume;
     if (playbackState_.externalDevice) {
         QUrl url(QStringLiteral("https://api.spotify.com/v1/me/player/volume"));
         QUrlQuery query;
         query.addQueryItem(QStringLiteral("volume_percent"),
-                           QString::number(qBound(0, volumePercent, 100)));
+                           QString::number(boundedVolume));
         if (!playbackState_.deviceId.isEmpty()) {
             query.addQueryItem(QStringLiteral("device_id"), playbackState_.deviceId);
         }
@@ -1068,9 +1073,11 @@ void SpotifyConnection::setPlaybackVolume(int volumePercent)
         sendPlayerCommand(QByteArrayLiteral("PUT"), url, {});
         return;
     }
-    localPlaybackState_.deviceVolumePercent = qBound(0, volumePercent, 100);
+    localPlaybackState_.deviceVolumePercent = boundedVolume;
     updateEffectivePlaybackState();
-    queueLocalPlaybackCommand(QStringLiteral("volume"), localPlaybackState_.deviceVolumePercent);
+    if (localPlaybackState_.deviceReady && localPlaybackState_.audioActivated) {
+        queueLocalPlaybackCommand(QStringLiteral("volume"), localPlaybackState_.deviceVolumePercent);
+    }
 }
 
 void SpotifyConnection::transferPlaybackToDevice(const QString &deviceId)
@@ -2908,7 +2915,8 @@ void SpotifyConnection::handlePlaybackRequest(QTcpSocket *socket, const QByteArr
             return;
         }
         respondToPlaybackBrowser(socket, 200, QByteArrayLiteral("OK"),
-                                 QByteArrayLiteral("text/html; charset=utf-8"), playbackPageHtml());
+                                 QByteArrayLiteral("text/html; charset=utf-8"),
+                                 playbackPageHtml(preferredPlaybackVolumePercent_));
         return;
     }
 
