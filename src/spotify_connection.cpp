@@ -50,8 +50,11 @@ constexpr qint64 spotifyTrackPageCacheLifetimeMs = 24LL * 60 * 60 * 1000;
 constexpr qint64 spotifyArtistMetadataCacheLifetimeMs = 30LL * 24 * 60 * 60 * 1000;
 constexpr qint64 spotifyArtistReleaseCacheLifetimeMs = 365LL * 24 * 60 * 60 * 1000;
 constexpr qint64 spotifyAlbumMetadataCacheLifetimeMs = 365LL * 24 * 60 * 60 * 1000;
+constexpr qint64 spotifyLyricsCacheLifetimeMs = 365LL * 24 * 60 * 60 * 1000;
+constexpr qint64 spotifyMissingLyricsCacheLifetimeMs = 7LL * 24 * 60 * 60 * 1000;
 constexpr qint64 spotifyTrackPageRetryDelayMs = 30LL * 60 * 1000;
 constexpr qint64 maxTrackPageCacheBytes = 64LL * 1024 * 1024;
+constexpr int maximumLyricsCacheEntries = 2000;
 constexpr int spotifyRequestTimeoutMs = 20000;
 constexpr int spotifyImageRequestTimeoutMs = 30000;
 constexpr int playbackStartupTimeoutMs = 25000;
@@ -651,6 +654,7 @@ SpotifyConnection::SpotifyConnection(QObject *parent)
         httpCache_->setMaximumCacheSize(16 * 1024 * 1024);
         networkManager_->setCache(httpCache_);
     }
+    loadLyricsCache();
     loginTimeout_->setSingleShot(true);
     refreshTimer_->setSingleShot(true);
     profileRetryTimer_->setSingleShot(true);
@@ -927,7 +931,7 @@ void SpotifyConnection::notifyDevicesUpdated()
 }
 
 void SpotifyConnection::playTracks(const QStringList &trackUris, const QString &contextUri,
-                                   const QString &offsetUri)
+                                   const QString &offsetUri, int positionMs)
 {
     if (!connected_ || accessToken_.isEmpty()) {
         if (playbackStatusHandler_) {
@@ -957,6 +961,7 @@ void SpotifyConnection::playTracks(const QStringList &trackUris, const QString &
     pendingPlaybackUris_ = trackUris;
     pendingPlaybackContextUri_ = contextUri;
     pendingPlaybackOffsetUri_ = offsetUri;
+    pendingPlaybackPositionMs_ = positionMs >= 0 ? positionMs : -1;
     startPlaybackCompanion();
     maybeStartPendingPlayback();
 }
@@ -1301,6 +1306,7 @@ void SpotifyConnection::disconnectAccount()
     pendingPlaybackUris_.clear();
     pendingPlaybackContextUri_.clear();
     pendingPlaybackOffsetUri_.clear();
+    pendingPlaybackPositionMs_ = -1;
     playbackPageOpened_ = false;
     playbackState_ = {};
     localPlaybackState_ = {};
@@ -1664,6 +1670,96 @@ void SpotifyConnection::saveMetadataToDisk(const QString &cacheKey,
     root.insert(QStringLiteral("expires_at_ms"), static_cast<double>(
         QDateTime::currentMSecsSinceEpoch() + lifetimeMs));
     root.insert(QStringLiteral("value"), value);
+    QSaveFile file(path);
+    if (file.open(QIODevice::WriteOnly)) {
+        file.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+        file.commit();
+    }
+}
+
+QString SpotifyConnection::lyricsCachePath() const
+{
+    const QString cacheBase = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+    if (cacheBase.isEmpty()) {
+        return {};
+    }
+    return QDir(cacheBase).filePath(QStringLiteral("spotify-lyrics.json"));
+}
+
+void SpotifyConnection::loadLyricsCache()
+{
+    QFile file(lyricsCachePath());
+    if (!file.open(QIODevice::ReadOnly)) {
+        return;
+    }
+
+    const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
+    if (!document.isObject()) {
+        return;
+    }
+
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    const QJsonObject entries = document.object().value(QStringLiteral("entries")).toObject();
+    for (auto entry = entries.constBegin(); entry != entries.constEnd(); ++entry) {
+        const QJsonObject object = entry.value().toObject();
+        CachedLyrics cached;
+        cached.cachedAtMs = static_cast<qint64>(
+            object.value(QStringLiteral("cached_at_ms")).toDouble());
+        cached.expiresAtMs = static_cast<qint64>(
+            object.value(QStringLiteral("expires_at_ms")).toDouble());
+        if (cached.expiresAtMs <= nowMs) {
+            continue;
+        }
+        cached.lyrics.plainLyrics = object.value(QStringLiteral("plain_lyrics")).toString();
+        cached.lyrics.syncedLyrics = object.value(QStringLiteral("synced_lyrics")).toString();
+        cached.lyrics.instrumental = object.value(QStringLiteral("instrumental")).toBool();
+        cached.errorMessage = object.value(QStringLiteral("error")).toString();
+        lyricsCache_.insert(entry.key(), std::move(cached));
+    }
+}
+
+void SpotifyConnection::saveLyricsCache()
+{
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    for (auto entry = lyricsCache_.begin(); entry != lyricsCache_.end();) {
+        if (entry->expiresAtMs <= nowMs) {
+            entry = lyricsCache_.erase(entry);
+        } else {
+            ++entry;
+        }
+    }
+
+    if (lyricsCache_.size() > maximumLyricsCacheEntries) {
+        QStringList keys = lyricsCache_.keys();
+        std::sort(keys.begin(), keys.end(), [this](const QString &left, const QString &right) {
+            return lyricsCache_.value(left).cachedAtMs < lyricsCache_.value(right).cachedAtMs;
+        });
+        const int excess = lyricsCache_.size() - maximumLyricsCacheEntries;
+        for (int index = 0; index < excess; ++index) {
+            lyricsCache_.remove(keys.at(index));
+        }
+    }
+
+    const QString path = lyricsCachePath();
+    if (path.isEmpty() || !QDir().mkpath(QFileInfo(path).absolutePath())) {
+        return;
+    }
+
+    QJsonObject entries;
+    for (auto entry = lyricsCache_.constBegin(); entry != lyricsCache_.constEnd(); ++entry) {
+        QJsonObject object;
+        object.insert(QStringLiteral("plain_lyrics"), entry->lyrics.plainLyrics);
+        object.insert(QStringLiteral("synced_lyrics"), entry->lyrics.syncedLyrics);
+        object.insert(QStringLiteral("instrumental"), entry->lyrics.instrumental);
+        object.insert(QStringLiteral("error"), entry->errorMessage);
+        object.insert(QStringLiteral("cached_at_ms"), static_cast<double>(entry->cachedAtMs));
+        object.insert(QStringLiteral("expires_at_ms"), static_cast<double>(entry->expiresAtMs));
+        entries.insert(entry.key(), object);
+    }
+
+    QJsonObject root;
+    root.insert(QStringLiteral("version"), 1);
+    root.insert(QStringLiteral("entries"), entries);
     QSaveFile file(path);
     if (file.open(QIODevice::WriteOnly)) {
         file.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
@@ -2355,6 +2451,116 @@ void SpotifyConnection::setImageCacheMaxSizeMb(int megabytes)
     pruneImageCache({}, 0);
 }
 
+void SpotifyConnection::fetchTrackLyrics(const QString &trackUri, const QString &trackName,
+                                         const QString &artistName,
+                                         const QString &albumName, int durationMs,
+                                         LyricsHandler handler)
+{
+    const QString normalizedTrack = trackName.trimmed();
+    const QString normalizedArtist = artistName.trimmed();
+    if (normalizedTrack.isEmpty() || normalizedArtist.isEmpty()) {
+        if (handler) {
+            handler({}, QStringLiteral("Track details are not available for a lyrics lookup."));
+        }
+        return;
+    }
+
+    const int durationSeconds = durationMs > 0 ? (durationMs + 500) / 1000 : 0;
+    const QString metadataIdentity = QStringList{
+        normalizedTrack.toCaseFolded(), normalizedArtist.toCaseFolded(),
+        albumName.trimmed().toCaseFolded(), QString::number(durationSeconds)
+    }.join(QLatin1Char('\n'));
+    const QString cacheIdentity = trackUri.trimmed().isEmpty()
+        ? metadataIdentity : trackUri.trimmed().toCaseFolded();
+    const QString cacheKey = QString::fromLatin1(QCryptographicHash::hash(
+        cacheIdentity.toUtf8(), QCryptographicHash::Sha256).toHex());
+    auto cached = lyricsCache_.find(cacheKey);
+    if (cached != lyricsCache_.end()
+        && cached->expiresAtMs > QDateTime::currentMSecsSinceEpoch()) {
+        if (handler) {
+            handler(cached->lyrics, cached->errorMessage);
+        }
+        return;
+    }
+    if (cached != lyricsCache_.end()) {
+        lyricsCache_.erase(cached);
+    }
+
+    QUrl url(QStringLiteral("https://lrclib.net/api/get"));
+    QUrlQuery query;
+    query.addQueryItem(QStringLiteral("track_name"), normalizedTrack);
+    query.addQueryItem(QStringLiteral("artist_name"), normalizedArtist);
+    if (!albumName.trimmed().isEmpty()) {
+        query.addQueryItem(QStringLiteral("album_name"), albumName.trimmed());
+    }
+    if (durationSeconds > 0 && durationSeconds <= 3600) {
+        query.addQueryItem(QStringLiteral("duration"), QString::number(durationSeconds));
+    }
+    url.setQuery(query);
+
+    QNetworkRequest request(url);
+    setRequestTimeout(request);
+    request.setRawHeader(QByteArrayLiteral("User-Agent"),
+                         QByteArrayLiteral("MusicPlayer/0.1.0 (https://github.com/HoszuAndreiAlexandru/MusicPlayer)"));
+    QNetworkReply *reply = networkManager_->get(request);
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, cacheKey, handler = std::move(handler)]() mutable {
+        const int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QByteArray responseBody = reply->readAll();
+        if (statusCode == 404) {
+            CachedLyrics cached;
+            cached.errorMessage = QStringLiteral("No lyrics were found for this track.");
+            cached.cachedAtMs = QDateTime::currentMSecsSinceEpoch();
+            cached.expiresAtMs = cached.cachedAtMs + spotifyMissingLyricsCacheLifetimeMs;
+            lyricsCache_.insert(cacheKey, std::move(cached));
+            saveLyricsCache();
+            reply->deleteLater();
+            if (handler) {
+                handler({}, QStringLiteral("No lyrics were found for this track."));
+            }
+            return;
+        }
+        if (reply->error() != QNetworkReply::NoError || statusCode < 200 || statusCode >= 300) {
+            const QString message = statusCode == 429
+                ? QStringLiteral("The lyrics provider is rate limiting requests. Try again shortly.")
+                : statusCode != 0
+                    ? QStringLiteral("The lyrics provider returned HTTP %1.").arg(statusCode)
+                    : reply->errorString();
+            reply->deleteLater();
+            if (handler) {
+                handler({}, message);
+            }
+            return;
+        }
+
+        QJsonParseError parseError{};
+        const QJsonDocument document = QJsonDocument::fromJson(responseBody, &parseError);
+        if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+            reply->deleteLater();
+            if (handler) {
+                handler({}, QStringLiteral("The lyrics provider returned an invalid response."));
+            }
+            return;
+        }
+
+        const QJsonObject object = document.object();
+        TrackLyrics lyrics;
+        lyrics.plainLyrics = object.value(QStringLiteral("plainLyrics")).toString();
+        lyrics.syncedLyrics = object.value(QStringLiteral("syncedLyrics")).toString();
+        lyrics.instrumental = object.value(QStringLiteral("instrumental")).toBool();
+        CachedLyrics cached;
+        cached.lyrics = lyrics;
+        cached.cachedAtMs = QDateTime::currentMSecsSinceEpoch();
+        cached.expiresAtMs = cached.cachedAtMs + spotifyLyricsCacheLifetimeMs;
+        lyricsCache_.insert(cacheKey, std::move(cached));
+        saveLyricsCache();
+        reply->deleteLater();
+        if (handler) {
+            handler(lyrics, {});
+        }
+    });
+}
+
 void SpotifyConnection::requestImage(const QString &imageUrl, ImageHandler handler)
 {
     if (!handler) {
@@ -2715,9 +2921,13 @@ void SpotifyConnection::maybeStartPendingPlayback()
         }
         body.insert(QStringLiteral("uris"), uris);
     }
+    if (pendingPlaybackPositionMs_ >= 0) {
+        body.insert(QStringLiteral("position_ms"), pendingPlaybackPositionMs_);
+    }
     pendingPlaybackUris_.clear();
     pendingPlaybackContextUri_.clear();
     pendingPlaybackOffsetUri_.clear();
+    pendingPlaybackPositionMs_ = -1;
     QUrl url(QStringLiteral("https://api.spotify.com/v1/me/player/play"));
     QUrlQuery query;
     query.addQueryItem(QStringLiteral("device_id"), playbackDeviceId_);
@@ -3377,6 +3587,7 @@ void SpotifyConnection::fail(const QString &message)
     pendingPlaybackUris_.clear();
     pendingPlaybackContextUri_.clear();
     pendingPlaybackOffsetUri_.clear();
+    pendingPlaybackPositionMs_ = -1;
     playbackPageOpened_ = false;
     playbackState_ = {};
     localPlaybackState_ = {};

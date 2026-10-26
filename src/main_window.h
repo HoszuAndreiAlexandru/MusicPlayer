@@ -3,6 +3,8 @@
 #include "spotify_connection.h"
 
 #include <QMainWindow>
+#include <QColor>
+#include <QElapsedTimer>
 #include <QHash>
 #include <QList>
 #include <QPoint>
@@ -23,6 +25,8 @@ class QSpinBox;
 class QStackedWidget;
 class QSplitter;
 class QToolButton;
+class QPropertyAnimation;
+class QVariantAnimation;
 class QSlider;
 class QTimer;
 class QEvent;
@@ -102,10 +106,18 @@ private:
     void tryFocusPlaybackTrack();
     void updatePlaybackUi(const SpotifyPlaybackState &state, bool fromSpotify = false);
     void updateNowPlayingPanel(const SpotifyPlaybackState &state);
+    void updateLyricsForPlayback(const SpotifyPlaybackState &state);
+    void closeLyricsView();
+    void displayLyrics(const TrackLyrics &lyrics, const QString &errorMessage);
+    void updateLyricsHighlight();
+    void updateLyricsColors(bool animate);
+    void refreshPlaybackPosition();
     void updatePlaybackProgress();
     void showStartupWindow();
 
     QStackedWidget *pageStack_ = nullptr;
+    QStackedWidget *mainContentStack_ = nullptr;
+    QStackedWidget *lyricsContentStack_ = nullptr;
     QSplitter *bodySplitter_ = nullptr;
     QLabel *spotifyStatusLabel_ = nullptr;
     QLabel *spotifyHeaderAvatarLabel_ = nullptr;
@@ -134,6 +146,9 @@ private:
     QFrame *nowPlayingPanel_ = nullptr;
     QLabel *playbackPositionLabel_ = nullptr;
     QLabel *playbackDurationLabel_ = nullptr;
+    QLabel *lyricsTrackLabel_ = nullptr;
+    QLabel *lyricsStatusLabel_ = nullptr;
+    QLabel *lyricsSyncStatusLabel_ = nullptr;
     QLineEdit *spotifyClientIdEdit_ = nullptr;
     QLineEdit *searchEdit_ = nullptr;
     QLineEdit *playlistFilterEdit_ = nullptr;
@@ -150,6 +165,7 @@ private:
     QToolButton *repeatButton_ = nullptr;
     QToolButton *deviceButton_ = nullptr;
     QToolButton *volumeMuteButton_ = nullptr;
+    QToolButton *lyricsButton_ = nullptr;
     QToolButton *nowPlayingPanelButton_ = nullptr;
     QToolButton *backButton_ = nullptr;
     QToolButton *forwardButton_ = nullptr;
@@ -157,6 +173,9 @@ private:
     QToolButton *settingsButton_ = nullptr;
     QToolButton *maximizeButton_ = nullptr;
     QListWidget *playlistsList_ = nullptr;
+    QListWidget *lyricsList_ = nullptr;
+    QPropertyAnimation *lyricsScrollAnimation_ = nullptr;
+    QVariantAnimation *lyricsColorAnimation_ = nullptr;
     QListWidget *searchArtistResultsList_ = nullptr;
     QListWidget *artistReleasesList_ = nullptr;
     QScrollArea *artistPageScroll_ = nullptr;
@@ -190,6 +209,7 @@ private:
     QString playbackSeekTrackUri_;
     QString displayedPlaybackArtworkUrl_;
     QString displayedNowPlayingArtistId_;
+    QString requestedNowPlayingArtistProfileId_;
     QString playbackSourceName_;
     QString playbackSourcePlaylistId_;
     QString currentArtistPageId_;
@@ -197,8 +217,11 @@ private:
     QString currentAlbumPageId_;
     QString currentAlbumPageName_;
     QString playbackSourceAlbumId_;
+    QString lyricsTrackUri_;
+    QVector<int> lyricLineStartTimesMs_;
+    QVector<QColor> lyricLineStartColors_;
+    QVector<QColor> lyricLineTargetColors_;
     QString loadedLibraryPlaylistId_;
-    QString pendingRestorePlaybackTrackUri_;
     QString pendingLibraryFocusTrackUri_;
     QString pendingLibraryFocusPlaylistId_;
     QString pendingAlbumFocusTrackUri_;
@@ -219,6 +242,9 @@ private:
     int artistPageScrollPosition_ = 0;
     int artistReleaseListScrollPosition_ = 0;
     int restoredPlaybackPositionMs_ = 0;
+    int currentLyricLineIndex_ = -1;
+    int playbackPositionSampleMs_ = 0;
+    QElapsedTimer playbackPositionClock_;
     int pendingTransportTrackRow_ = -1;
     int pendingTransportPage_ = -1;
     qint64 pendingTransportUntilMs_ = 0;
@@ -240,6 +266,7 @@ private:
     quint64 libraryArtworkRequestId_ = 0;
     quint64 artistPageRequestId_ = 0;
     quint64 albumPageRequestId_ = 0;
+    quint64 lyricsRequestId_ = 0;
     int libraryTotalTracks_ = 0;
     int artistReleaseOffset_ = 0;
     int artistReleaseTotal_ = 0;
@@ -269,5 +296,7 @@ private:
     bool albumTrackRequestActive_ = false;
     bool restoreAlbumScrollPending_ = false;
     bool restoredPlaybackPending_ = false;
-    bool pendingRestorePlaybackSeek_ = false;
+    bool lyricsViewOpen_ = false;
+    bool lyricsRequestInFlight_ = false;
+    bool lyricsLoaded_ = false;
 };

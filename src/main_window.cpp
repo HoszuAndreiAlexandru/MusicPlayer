@@ -6,6 +6,7 @@
 #include <QAbstractTableModel>
 #include <QAbstractSpinBox>
 #include <QApplication>
+#include <QBrush>
 #include <QEasingCurve>
 #include <QColor>
 #include <QCursor>
@@ -39,12 +40,14 @@
 #include <QPainterPath>
 #include <QPen>
 #include <QPointer>
+#include <QPair>
 #include <QPropertyAnimation>
 #include <QPixmap>
 #include <QPolygonF>
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QRegion>
+#include <QRegularExpression>
 #include <QScreen>
 #include <QSignalBlocker>
 #include <QShowEvent>
@@ -66,6 +69,7 @@
 #include <QTimer>
 #include <QToolButton>
 #include <QToolTip>
+#include <QVariantAnimation>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QMessageBox>
@@ -1540,6 +1544,29 @@ QIcon playbackControlIcon(
             painter.drawRoundedRect(QRectF(5.0, 4.0, 5.5, 16.0), 1.2, 1.2);
             painter.drawRoundedRect(QRectF(13.5, 4.0, 5.5, 16.0), 1.2, 1.2);
         }
+        icon.addPixmap(pixmap, mode, QIcon::Off);
+    }
+    return icon;
+}
+
+QIcon lyricsMicrophoneIcon(bool selected = false)
+{
+    QIcon icon;
+    for (const QIcon::Mode mode : {QIcon::Normal, QIcon::Active, QIcon::Disabled}) {
+        QPixmap pixmap(24, 24);
+        pixmap.fill(Qt::transparent);
+        QPainter painter(&pixmap);
+        painter.setRenderHint(QPainter::Antialiasing);
+        const QColor color = mode == QIcon::Disabled ? QColor(QStringLiteral("#6a6a6a"))
+            : selected ? QColor(QStringLiteral("#1ed760"))
+            : mode == QIcon::Active ? QColor(Qt::white)
+                                    : QColor(QStringLiteral("#b3b3b3"));
+        painter.setPen(QPen(color, 1.8, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawRoundedRect(QRectF(9.0, 3.0, 6.0, 12.0), 3.0, 3.0);
+        painter.drawArc(QRectF(5.5, 7.5, 13.0, 12.0), 180 * 16, 180 * 16);
+        painter.drawLine(QPointF(12.0, 19.0), QPointF(12.0, 22.0));
+        painter.drawLine(QPointF(8.0, 22.0), QPointF(16.0, 22.0));
         icon.addPixmap(pixmap, mode, QIcon::Off);
     }
     return icon;
@@ -3292,8 +3319,75 @@ MainWindow::MainWindow(QWidget *parent)
     mainLayout->setContentsMargins(0, 0, 0, 0);
     mainLayout->setSpacing(0);
 
-    pageStack_ = new QStackedWidget(mainPanel);
-    mainLayout->addWidget(pageStack_, 1);
+    mainContentStack_ = new QStackedWidget(mainPanel);
+    pageStack_ = new QStackedWidget(mainContentStack_);
+    mainContentStack_->addWidget(pageStack_);
+
+    auto *lyricsPage = new QWidget(mainContentStack_);
+    lyricsPage->setObjectName(QStringLiteral("lyricsPage"));
+    auto *lyricsPageLayout = new QVBoxLayout(lyricsPage);
+    lyricsPageLayout->setContentsMargins(24, 20, 24, 16);
+    lyricsPageLayout->setSpacing(8);
+    auto *lyricsHeading = makeLabel(QStringLiteral("Lyrics"), QStringLiteral("lyricsHeading"));
+    lyricsPageLayout->addWidget(lyricsHeading);
+    lyricsTrackLabel_ = makeLabel(QStringLiteral("Nothing playing"),
+                                  QStringLiteral("lyricsTrackTitle"));
+    lyricsTrackLabel_->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    lyricsTrackLabel_->setWordWrap(false);
+    lyricsPageLayout->addWidget(lyricsTrackLabel_);
+
+    lyricsContentStack_ = new QStackedWidget(lyricsPage);
+    auto *lyricsEmptyPage = new QWidget(lyricsContentStack_);
+    auto *lyricsEmptyLayout = new QVBoxLayout(lyricsEmptyPage);
+    lyricsEmptyLayout->addStretch(1);
+    lyricsStatusLabel_ = makeLabel(QStringLiteral("Play a track to find its lyrics."),
+                                   QStringLiteral("lyricsStatus"));
+    lyricsStatusLabel_->setAlignment(Qt::AlignCenter);
+    lyricsStatusLabel_->setWordWrap(true);
+    lyricsEmptyLayout->addWidget(lyricsStatusLabel_);
+    lyricsEmptyLayout->addStretch(1);
+    lyricsContentStack_->addWidget(lyricsEmptyPage);
+
+    lyricsList_ = new QListWidget(lyricsContentStack_);
+    lyricsList_->setObjectName(QStringLiteral("lyricsList"));
+    lyricsList_->setSelectionMode(QAbstractItemView::NoSelection);
+    lyricsList_->setFocusPolicy(Qt::NoFocus);
+    lyricsList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    lyricsList_->setWordWrap(true);
+    lyricsList_->setUniformItemSizes(false);
+    lyricsList_->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    lyricsScrollAnimation_ = new QPropertyAnimation(
+        lyricsList_->verticalScrollBar(), QByteArrayLiteral("value"), this);
+    lyricsScrollAnimation_->setDuration(480);
+    lyricsScrollAnimation_->setEasingCurve(QEasingCurve::InOutCubic);
+    lyricsColorAnimation_ = new QVariantAnimation(this);
+    lyricsColorAnimation_->setDuration(320);
+    lyricsColorAnimation_->setEasingCurve(QEasingCurve::InOutCubic);
+    connect(lyricsColorAnimation_, &QVariantAnimation::valueChanged, this,
+            [this](const QVariant &value) {
+        const qreal progress = value.toReal();
+        const int count = qMin(lyricsList_->count(),
+                               qMin(lyricLineStartColors_.size(),
+                                    lyricLineTargetColors_.size()));
+        for (int index = 0; index < count; ++index) {
+            const QColor from = lyricLineStartColors_.at(index);
+            const QColor to = lyricLineTargetColors_.at(index);
+            const QColor color(
+                qRound(from.red() + (to.red() - from.red()) * progress),
+                qRound(from.green() + (to.green() - from.green()) * progress),
+                qRound(from.blue() + (to.blue() - from.blue()) * progress));
+            lyricsList_->item(index)->setForeground(QBrush(color));
+        }
+    });
+    lyricsContentStack_->addWidget(lyricsList_);
+    lyricsPageLayout->addWidget(lyricsContentStack_, 1);
+    lyricsSyncStatusLabel_ = makeLabel(QString{}, QStringLiteral("lyricsSyncStatus"));
+    lyricsSyncStatusLabel_->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    lyricsPageLayout->addWidget(lyricsSyncStatusLabel_);
+    mainContentStack_->addWidget(lyricsPage);
+    mainLayout->addWidget(mainContentStack_, 1);
+    new HoverScrollBarBehavior(lyricsList_);
+    new SmoothWheelScrollFilter(lyricsList_, 54);
 
     auto *homePage = makePage("Your music, with a calmer interface.",
                               "A desktop player built with Qt Widgets. Connect your account to bring in your playlists and playback.");
@@ -4202,6 +4296,17 @@ MainWindow::MainWindow(QWidget *parent)
     deviceButton_->setEnabled(false);
     deviceButton_->setVisible(false);
     volumeRow->addWidget(deviceButton_);
+    lyricsButton_ = new QToolButton(playerBar);
+    lyricsButton_->setObjectName(QStringLiteral("lyricsButton"));
+    lyricsButton_->setIcon(lyricsMicrophoneIcon());
+    lyricsButton_->setIconSize(QSize(20, 20));
+    lyricsButton_->setFixedSize(30, 30);
+    lyricsButton_->setToolButtonStyle(Qt::ToolButtonIconOnly);
+    lyricsButton_->setCheckable(true);
+    lyricsButton_->setAccessibleName(QStringLiteral("Show lyrics"));
+    lyricsButton_->setToolTip(QStringLiteral("Show lyrics"));
+    lyricsButton_->setAutoRaise(true);
+    volumeRow->addWidget(lyricsButton_);
     nowPlayingPanelButton_ = new QToolButton(playerBar);
     nowPlayingPanelButton_->setObjectName(QStringLiteral("nowPlayingPanelButton"));
     nowPlayingPanelButton_->setIcon(nowPlayingPanelIcon());
@@ -4251,6 +4356,18 @@ MainWindow::MainWindow(QWidget *parent)
                                     panelWidth});
         }
     });
+    connect(lyricsButton_, &QToolButton::toggled, this, [this](bool open) {
+        lyricsViewOpen_ = open;
+        lyricsButton_->setIcon(lyricsMicrophoneIcon(open));
+        lyricsButton_->setAccessibleName(open ? QStringLiteral("Hide lyrics")
+                                              : QStringLiteral("Show lyrics"));
+        lyricsButton_->setToolTip(open ? QStringLiteral("Hide lyrics")
+                                       : QStringLiteral("Show lyrics"));
+        mainContentStack_->setCurrentIndex(open ? 1 : 0);
+        if (open) {
+            updateLyricsForPlayback(playbackState_);
+        }
+    });
     connect(previousTrackButton_, &QToolButton::clicked, this,
             [this] { skipTrackInCurrentList(-1); });
     connect(nextTrackButton_, &QToolButton::clicked, this,
@@ -4283,8 +4400,6 @@ MainWindow::MainWindow(QWidget *parent)
             playbackUiCommandUntilMs_ = QDateTime::currentMSecsSinceEpoch() + 8000;
             playPauseButton_->setIcon(playbackControlIcon(2, Qt::black, Qt::black));
             playPauseButton_->setToolTip(QStringLiteral("Pause"));
-            pendingRestorePlaybackSeek_ = true;
-            pendingRestorePlaybackTrackUri_ = trackUri;
             lastRequestedTrackUri_ = trackUri;
             QString contextUri;
             if (!playbackSourcePlaylistId_.isEmpty()) {
@@ -4294,8 +4409,12 @@ MainWindow::MainWindow(QWidget *parent)
                 contextUri = QStringLiteral("spotify:album:%1")
                                  .arg(playbackSourceAlbumId_);
             }
-            if (contextUri.isEmpty()) spotifyConnection_->playTracks({trackUri});
-            else spotifyConnection_->playTracks({}, contextUri, trackUri);
+            if (contextUri.isEmpty()) {
+                spotifyConnection_->playTracks({trackUri}, {}, {}, restoredPlaybackPositionMs_);
+            } else {
+                spotifyConnection_->playTracks({}, contextUri, trackUri,
+                                               restoredPlaybackPositionMs_);
+            }
             return;
         }
         const bool samePendingTrack = playbackUiCommandPending_
@@ -4342,12 +4461,15 @@ MainWindow::MainWindow(QWidget *parent)
     connect(playbackProgressSlider_, &QSlider::sliderReleased, this, [this] {
         if (playbackState_.active) {
             playbackState_.positionMs = playbackProgressSlider_->value();
+            playbackPositionSampleMs_ = playbackState_.positionMs;
+            playbackPositionClock_.restart();
             playbackSeekPending_ = true;
             playbackSeekTrackUri_ = playbackState_.trackUri;
             playbackSeekTargetMs_ = playbackState_.positionMs;
             playbackSeekPendingUntilMs_ = QDateTime::currentMSecsSinceEpoch() + 4000;
             playbackPositionLabel_->setText(formatPlaybackTime(playbackState_.positionMs));
             spotifyConnection_->seekPlayback(playbackState_.positionMs);
+            updateLyricsHighlight();
         }
     });
     connect(playbackVolumeSlider_, &QSlider::valueChanged, this, [this](int volume) {
@@ -4538,6 +4660,26 @@ MainWindow::MainWindow(QWidget *parent)
             border-top: 1px solid #282828;
             border-radius: 0;
         }
+        QWidget#lyricsPage { background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #353b38, stop: 0.55 #202320, stop: 1 #181818); }
+        QLabel#lyricsHeading { color: #ffffff; font-size: 28px; font-weight: 700; }
+        QLabel#lyricsTrackTitle { color: #b3b3b3; font-size: 14px; }
+        QLabel#lyricsStatus, QLabel#lyricsSyncStatus {
+            color: #b3b3b3;
+            font-size: 13px;
+        }
+        QListWidget#lyricsList {
+            background: transparent;
+            border: none;
+            outline: none;
+            padding: 14px 0;
+        }
+        QListWidget#lyricsList::item {
+            background: transparent;
+            border: none;
+            padding: 10px 18px;
+        }
+        QListWidget#lyricsList::item:hover,
+        QListWidget#lyricsList::item:selected { background: transparent; }
         QLabel#librarySidebarHeading { font-size: 18px; font-weight: 700; padding: 3px 2px; }
         QLabel#eyebrow { color: #b3b3b3; font-size: 10px; font-weight: 700; }
         QLabel#mutedText { color: #b3b3b3; }
@@ -4657,6 +4799,16 @@ MainWindow::MainWindow(QWidget *parent)
         }
         QToolButton#volumeMuteButton:hover { background: #282828; border-radius: 5px; }
         QToolButton#volumeMuteButton:disabled { background: transparent; }
+        QToolButton#lyricsButton {
+            color: #b3b3b3;
+            background: transparent;
+            border: none;
+            border-radius: 5px;
+            padding: 0;
+        }
+        QToolButton#lyricsButton:hover { background: #282828; color: #ffffff; }
+        QToolButton#lyricsButton:checked,
+        QToolButton#lyricsButton:checked:hover { background: transparent; color: #1ed760; }
         QToolButton#deviceButton { background: transparent; border: none; padding: 0; }
         QToolButton#deviceButton:hover { background: #282828; border-radius: 5px; }
         QToolButton#deviceButton:disabled { background: transparent; }
@@ -5255,6 +5407,7 @@ void MainWindow::addLibrarySidebarItem(const SpotifyLibraryItem &libraryItem)
 
 void MainWindow::performSearch()
 {
+    closeLyricsView();
     const QString query = searchEdit_->text().trimmed();
     recordNavigation({searchPageIndex, {}, {}, query});
     pageStack_->setCurrentIndex(searchPageIndex);
@@ -5345,6 +5498,7 @@ void MainWindow::navigateToPage(int pageIndex)
     if (pageIndex < homePageIndex || pageIndex > settingsPageIndex) {
         return;
     }
+    closeLyricsView();
     NavigationEntry entry;
     entry.pageIndex = pageIndex;
     if (pageIndex == searchPageIndex) {
@@ -5356,6 +5510,7 @@ void MainWindow::navigateToPage(int pageIndex)
 
 void MainWindow::navigateToEntry(const NavigationEntry &entry)
 {
+    closeLyricsView();
     restoringNavigation_ = true;
     restoreNavigationScroll(entry);
     if (entry.pageIndex == artistPageIndex) {
@@ -5558,6 +5713,7 @@ void MainWindow::filterPlaylists(const QString &query)
 
 void MainWindow::showSavedTracks()
 {
+    closeLyricsView();
     recordNavigation({libraryPageIndex, {}, QStringLiteral("Liked Songs"), {}});
     if (!restoringNavigation_) {
         restoreLibraryScrollPending_ = false;
@@ -5579,6 +5735,7 @@ void MainWindow::showPlaylist(const QString &playlistId, const QString &playlist
     if (playlistId.isEmpty()) {
         return;
     }
+    closeLyricsView();
     recordNavigation({libraryPageIndex, playlistId, playlistName, {}});
     if (!restoringNavigation_) {
         restoreLibraryScrollPending_ = false;
@@ -5967,8 +6124,6 @@ void MainWindow::playTrackFromTable(QTableView *table, TrackTableModel *model, i
 
     if (restoredPlaybackPending_ && uri != playbackState_.trackUri) {
         restoredPlaybackPending_ = false;
-        pendingRestorePlaybackSeek_ = false;
-        pendingRestorePlaybackTrackUri_.clear();
     }
 
     if (table == libraryTracksTable_) {
@@ -6042,6 +6197,7 @@ void MainWindow::openArtistById(const QString &artistId, const QString &artistNa
 void MainWindow::showArtistPage(const QString &artistId, const QString &artistName)
 {
     if (artistId.isEmpty()) return;
+    closeLyricsView();
     NavigationEntry entry;
     entry.pageIndex = artistPageIndex;
     entry.artistId = artistId;
@@ -6288,6 +6444,7 @@ void MainWindow::appendArtistReleases(const QList<SpotifyAlbumProfile> &albums)
 void MainWindow::showAlbumPage(const QString &albumId, const QString &albumName)
 {
     if (albumId.isEmpty()) return;
+    closeLyricsView();
     if (!restoringNavigation_ && pageStack_->currentIndex() == albumPageIndex
         && currentAlbumPageId_ == albumId) {
         return;
@@ -6539,8 +6696,6 @@ void MainWindow::playSelectedTrack()
     }
     if (restoredPlaybackPending_ && uri != playbackState_.trackUri) {
         restoredPlaybackPending_ = false;
-        pendingRestorePlaybackSeek_ = false;
-        pendingRestorePlaybackTrackUri_.clear();
     }
     if (pageStack_->currentIndex() == libraryPageIndex) {
         playbackSourceName_ = activeLibraryPlaylistName_.isEmpty()
@@ -6698,6 +6853,7 @@ void MainWindow::skipTrackInCurrentList(int direction)
 
 void MainWindow::focusPlaybackSource()
 {
+    closeLyricsView();
     const QString trackUri = playbackState_.trackUri;
     if (!playbackState_.active || trackUri.isEmpty()) {
         return;
@@ -6858,8 +7014,12 @@ void MainWindow::updateNowPlayingPanel(const SpotifyPlaybackState &state)
 
     const QString primaryArtist = state.artists.section(QLatin1Char(','), 0, 0).trimmed();
     nowPlayingPanelArtistNameLabel_->setClickable(state.active && !artistId.isEmpty());
-    if (artistId != displayedNowPlayingArtistId_) {
+    const bool artistProfileRequestNeeded = !artistId.isEmpty()
+        && spotifyConnection_->isConnected()
+        && requestedNowPlayingArtistProfileId_ != artistId;
+    if (artistId != displayedNowPlayingArtistId_ || artistProfileRequestNeeded) {
         displayedNowPlayingArtistId_ = artistId;
+        requestedNowPlayingArtistProfileId_.clear();
         ++nowPlayingArtistRequestId_;
         const quint64 requestId = nowPlayingArtistRequestId_;
         nowPlayingPanelArtistArtworkLabel_->clearImage();
@@ -6873,6 +7033,7 @@ void MainWindow::updateNowPlayingPanel(const SpotifyPlaybackState &state)
             : QStringLiteral("Loading artist details…"));
 
         if (!artistId.isEmpty() && spotifyConnection_->isConnected()) {
+            requestedNowPlayingArtistProfileId_ = artistId;
             QPointer<QLabel> nameGuard(nowPlayingPanelArtistNameLabel_);
             QPointer<QLabel> listenersGuard(nowPlayingPanelArtistListenersLabel_);
             QPointer<QLabel> infoGuard(nowPlayingPanelArtistInfoLabel_);
@@ -6943,17 +7104,6 @@ void MainWindow::updatePlaybackUi(const SpotifyPlaybackState &state, bool fromSp
         incomingState.supportsVolume = state.supportsVolume;
     } else if (fromSpotify && state.active) {
         restoredPlaybackPending_ = false;
-        if (pendingRestorePlaybackSeek_) {
-            if (state.trackUri == pendingRestorePlaybackTrackUri_) {
-                playbackSeekPending_ = true;
-                playbackSeekTrackUri_ = state.trackUri;
-                playbackSeekTargetMs_ = restoredPlaybackPositionMs_;
-                playbackSeekPendingUntilMs_ = QDateTime::currentMSecsSinceEpoch() + 5000;
-                spotifyConnection_->seekPlayback(restoredPlaybackPositionMs_);
-            }
-            pendingRestorePlaybackSeek_ = false;
-            pendingRestorePlaybackTrackUri_.clear();
-        }
     }
 
     const QString previousTrackUri = playbackState_.trackUri;
@@ -6992,6 +7142,8 @@ void MainWindow::updatePlaybackUi(const SpotifyPlaybackState &state, bool fromSp
         }
     }
     playbackState_ = updatedState;
+    playbackPositionSampleMs_ = updatedState.positionMs;
+    playbackPositionClock_.restart();
     if (updatedState.active && updatedState.externalDevice
         && updatedState.trackUri != previousTrackUri) {
         playbackSourceName_ = QStringLiteral("Spotify Connect");
@@ -7002,6 +7154,7 @@ void MainWindow::updatePlaybackUi(const SpotifyPlaybackState &state, bool fromSp
             ? QStringLiteral("Spotify Connect") : QStringLiteral("Spotify");
     }
     updateNowPlayingPanel(updatedState);
+    updateLyricsForPlayback(updatedState);
     if (nowPlayingArtworkLabel_
         && displayedPlaybackArtworkUrl_ != updatedState.artworkUrl) {
         displayedPlaybackArtworkUrl_ = updatedState.artworkUrl;
@@ -7009,6 +7162,9 @@ void MainWindow::updatePlaybackUi(const SpotifyPlaybackState &state, bool fromSp
         const quint64 requestId = playbackArtworkRequestId_;
         nowPlayingArtworkLabel_->setPixmap(QPixmap{});
         nowPlayingArtworkLabel_->setText(QStringLiteral("♪"));
+        if (auto *lyricsPage = findChild<QWidget *>(QStringLiteral("lyricsPage"))) {
+            lyricsPage->setStyleSheet(QString{});
+        }
         if (!updatedState.artworkUrl.isEmpty()) {
             QPointer<QLabel> artworkGuard(nowPlayingArtworkLabel_);
             spotifyConnection_->requestImage(updatedState.artworkUrl,
@@ -7019,6 +7175,39 @@ void MainWindow::updatePlaybackUi(const SpotifyPlaybackState &state, bool fromSp
                 artworkGuard->setText(QString{});
                 artworkGuard->setPixmap(QPixmap::fromImage(image).scaled(
                     artworkGuard->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+                if (auto *lyricsPage = findChild<QWidget *>(QStringLiteral("lyricsPage"))) {
+                    const QImage colorSamples = image.scaled(
+                        24, 24, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+                    QColor vividArtworkColor(QStringLiteral("#6958c8"));
+                    int strongestColorScore = -1;
+                    for (int y = 0; y < colorSamples.height(); ++y) {
+                        for (int x = 0; x < colorSamples.width(); ++x) {
+                            const QColor candidate = colorSamples.pixelColor(x, y);
+                            const int brightness = candidate.value();
+                            if (brightness < 45 || brightness > 245) {
+                                continue;
+                            }
+                            const int score = candidate.hsvSaturation() * brightness;
+                            if (score > strongestColorScore) {
+                                strongestColorScore = score;
+                                vividArtworkColor = candidate;
+                            }
+                        }
+                    }
+                    const int hue = vividArtworkColor.hsvHue() < 0
+                        ? 268 : vividArtworkColor.hsvHue();
+                    const QColor topTint = QColor::fromHsv(
+                        hue, qMax(205, vividArtworkColor.hsvSaturation()),
+                        qBound(125, vividArtworkColor.value(), 205));
+                    const QColor middleTint = QColor::fromHsv(
+                        hue, qMax(180, vividArtworkColor.hsvSaturation()),
+                        qMax(72, topTint.value() * 62 / 100));
+                    lyricsPage->setStyleSheet(QStringLiteral(
+                        "QWidget#lyricsPage { background: qlineargradient("
+                        "x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 %1, "
+                        "stop: 0.48 %2, stop: 1 #181818); }")
+                        .arg(topTint.name(), middleTint.name()));
+                }
             });
         }
     }
@@ -7251,14 +7440,325 @@ void MainWindow::showStartupWindow()
     activateWindow();
 }
 
+void MainWindow::closeLyricsView()
+{
+    if (lyricsButton_ && lyricsButton_->isChecked()) {
+        lyricsButton_->setChecked(false);
+    }
+}
+
+void MainWindow::updateLyricsForPlayback(const SpotifyPlaybackState &state)
+{
+    if (!lyricsViewOpen_) {
+        return;
+    }
+
+    if (!state.active || (state.trackUri.isEmpty() && state.trackName.isEmpty())) {
+        ++lyricsRequestId_;
+        lyricsRequestInFlight_ = false;
+        lyricsLoaded_ = false;
+        lyricsScrollAnimation_->stop();
+        lyricsColorAnimation_->stop();
+        lyricsTrackUri_.clear();
+        currentLyricLineIndex_ = -1;
+        lyricLineStartTimesMs_.clear();
+        lyricLineStartColors_.clear();
+        lyricLineTargetColors_.clear();
+        lyricsList_->clear();
+        lyricsTrackLabel_->setText(QStringLiteral("Nothing playing"));
+        lyricsStatusLabel_->setText(QStringLiteral("Play a track to find its lyrics."));
+        lyricsSyncStatusLabel_->clear();
+        lyricsContentStack_->setCurrentIndex(0);
+        return;
+    }
+
+    const QString trackIdentity = !state.trackUri.isEmpty()
+        ? state.trackUri
+        : state.trackName + QLatin1Char('\n') + state.artists;
+    if (trackIdentity == lyricsTrackUri_ && (lyricsRequestInFlight_ || lyricsLoaded_)) {
+        updateLyricsHighlight();
+        return;
+    }
+
+    lyricsTrackUri_ = trackIdentity;
+    const quint64 requestId = ++lyricsRequestId_;
+    lyricsRequestInFlight_ = true;
+    lyricsLoaded_ = false;
+    lyricsScrollAnimation_->stop();
+    lyricsColorAnimation_->stop();
+    currentLyricLineIndex_ = -1;
+    lyricLineStartTimesMs_.clear();
+    lyricLineStartColors_.clear();
+    lyricLineTargetColors_.clear();
+    lyricsList_->clear();
+    lyricsTrackLabel_->setText(state.artists.isEmpty()
+        ? state.trackName
+        : QStringLiteral("%1 — %2").arg(state.trackName, state.artists));
+    lyricsStatusLabel_->setText(QStringLiteral("Looking up lyrics…"));
+    lyricsSyncStatusLabel_->clear();
+    lyricsContentStack_->setCurrentIndex(0);
+
+    if (!spotifyConnection_) {
+        lyricsRequestInFlight_ = false;
+        lyricsLoaded_ = true;
+        lyricsStatusLabel_->setText(QStringLiteral("The lyrics service is unavailable."));
+        return;
+    }
+
+    spotifyConnection_->fetchTrackLyrics(
+        state.trackUri, state.trackName, state.artists, state.album, state.durationMs,
+        [this, requestId, trackIdentity](const TrackLyrics &lyrics, const QString &error) {
+            if (requestId != lyricsRequestId_ || trackIdentity != lyricsTrackUri_) {
+                return;
+            }
+            lyricsRequestInFlight_ = false;
+            lyricsLoaded_ = true;
+            displayLyrics(lyrics, error);
+        });
+}
+
+void MainWindow::displayLyrics(const TrackLyrics &lyrics, const QString &errorMessage)
+{
+    lyricsColorAnimation_->stop();
+    lyricsList_->clear();
+    lyricLineStartTimesMs_.clear();
+    lyricLineStartColors_.clear();
+    lyricLineTargetColors_.clear();
+    currentLyricLineIndex_ = -1;
+    lyricsSyncStatusLabel_->clear();
+
+    if (!errorMessage.isEmpty()) {
+        lyricsStatusLabel_->setText(errorMessage);
+        lyricsContentStack_->setCurrentIndex(0);
+        return;
+    }
+    if (lyrics.instrumental) {
+        lyricsStatusLabel_->setText(QStringLiteral("Instrumental track — no lyrics."));
+        lyricsContentStack_->setCurrentIndex(0);
+        return;
+    }
+
+    QVector<QPair<int, QString>> lines;
+    bool hasTimedLyrics = false;
+    if (!lyrics.syncedLyrics.trimmed().isEmpty()) {
+        static const QRegularExpression timestampPattern(
+            QStringLiteral(R"(\[(\d+):(\d{2})(?:\.(\d{1,3}))?\])"));
+        const QStringList sourceLines = lyrics.syncedLyrics.split(QLatin1Char('\n'));
+        for (QString sourceLine : sourceLines) {
+            sourceLine = sourceLine.trimmed();
+            if (sourceLine.isEmpty()) {
+                continue;
+            }
+
+            QVector<int> timestamps;
+            auto matches = timestampPattern.globalMatch(sourceLine);
+            while (matches.hasNext()) {
+                const QRegularExpressionMatch match = matches.next();
+                const int minutes = match.captured(1).toInt();
+                const int seconds = match.captured(2).toInt();
+                const QString fraction = match.captured(3).leftJustified(3, QLatin1Char('0'));
+                const int milliseconds = fraction.isEmpty() ? 0 : fraction.left(3).toInt();
+                timestamps.append(((minutes * 60) + seconds) * 1000 + milliseconds);
+            }
+
+            const QString lyricText = sourceLine.replace(timestampPattern, QString{}).trimmed();
+            if (lyricText.isEmpty() || (lyricText.startsWith(QLatin1Char('['))
+                                        && lyricText.endsWith(QLatin1Char(']')))) {
+                continue;
+            }
+            if (timestamps.isEmpty()) {
+                lines.append(qMakePair(-1, lyricText));
+            } else {
+                hasTimedLyrics = true;
+                for (const int timestamp : timestamps) {
+                    lines.append(qMakePair(timestamp, lyricText));
+                }
+            }
+        }
+    }
+
+    if (lines.isEmpty() && !lyrics.plainLyrics.trimmed().isEmpty()) {
+        const QStringList plainLines = lyrics.plainLyrics.split(QLatin1Char('\n'));
+        for (const QString &line : plainLines) {
+            const QString trimmedLine = line.trimmed();
+            if (!trimmedLine.isEmpty()) {
+                lines.append(qMakePair(-1, trimmedLine));
+            }
+        }
+    }
+
+    if (lines.isEmpty()) {
+        lyricsStatusLabel_->setText(QStringLiteral("No lyrics are available for this track."));
+        lyricsContentStack_->setCurrentIndex(0);
+        return;
+    }
+
+    lyricsStatusLabel_->clear();
+    if (!hasTimedLyrics) {
+        lyricsSyncStatusLabel_->setText(QStringLiteral("These lyrics are not synced to playback."));
+    }
+    for (const auto &line : lines) {
+        auto *item = new QListWidgetItem(line.second, lyricsList_);
+        item->setTextAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        item->setForeground(QBrush(QColor(QStringLiteral("#b3b3b3"))));
+        QFont font = item->font();
+        font.setPointSize(20);
+        font.setWeight(QFont::DemiBold);
+        item->setFont(font);
+        item->setSizeHint(QSize(0, 68));
+        lyricLineStartTimesMs_.append(line.first);
+    }
+    updateLyricsColors(false);
+    lyricsContentStack_->setCurrentIndex(1);
+    updateLyricsHighlight();
+}
+
+void MainWindow::updateLyricsColors(bool animate)
+{
+    if (!lyricsList_ || lyricsList_->count() == 0
+        || lyricsList_->count() != lyricLineStartTimesMs_.size()) {
+        return;
+    }
+
+    const QColor sungColor(QStringLiteral("#b3b3b3"));
+    const QColor upcomingColor(Qt::white);
+    int activeStartTimeMs = -1;
+    for (const int startTimeMs : lyricLineStartTimesMs_) {
+        if (startTimeMs >= 0 && startTimeMs <= playbackState_.positionMs) {
+            activeStartTimeMs = qMax(activeStartTimeMs, startTimeMs);
+        }
+    }
+    QVector<QColor> targets;
+    targets.reserve(lyricLineStartTimesMs_.size());
+    for (const int startTimeMs : lyricLineStartTimesMs_) {
+        if (startTimeMs < 0) {
+            // Plain or untimed lines cannot be classified by playback position.
+            targets.append(sungColor);
+        } else {
+            targets.append(activeStartTimeMs >= 0 && startTimeMs < activeStartTimeMs
+                               ? sungColor : upcomingColor);
+        }
+    }
+
+    const bool colorsInitialized = lyricLineTargetColors_.size() == targets.size()
+        && lyricLineStartColors_.size() == targets.size();
+    if (!animate || !colorsInitialized) {
+        lyricsColorAnimation_->stop();
+        lyricLineStartColors_ = targets;
+        lyricLineTargetColors_ = targets;
+        for (int index = 0; index < targets.size(); ++index) {
+            lyricsList_->item(index)->setForeground(QBrush(targets.at(index)));
+        }
+        return;
+    }
+
+    bool changed = false;
+    for (int index = 0; index < targets.size(); ++index) {
+        if (targets.at(index) != lyricLineTargetColors_.at(index)) {
+            changed = true;
+            break;
+        }
+    }
+    if (!changed) {
+        return;
+    }
+
+    lyricsColorAnimation_->stop();
+    lyricLineStartColors_.clear();
+    lyricLineStartColors_.reserve(targets.size());
+    for (int index = 0; index < targets.size(); ++index) {
+        lyricLineStartColors_.append(lyricsList_->item(index)->foreground().color());
+    }
+    lyricLineTargetColors_ = targets;
+    lyricsColorAnimation_->setStartValue(0.0);
+    lyricsColorAnimation_->setEndValue(1.0);
+    lyricsColorAnimation_->start();
+}
+
+void MainWindow::refreshPlaybackPosition()
+{
+    if (!playbackState_.active || playbackState_.paused) {
+        return;
+    }
+
+    const qint64 elapsedMs = playbackPositionClock_.isValid()
+        ? playbackPositionClock_.elapsed() : 0;
+    const qint64 estimatedPositionMs = playbackPositionSampleMs_ + elapsedMs;
+    playbackState_.positionMs = qMin(playbackState_.durationMs,
+        static_cast<int>(qMin<qint64>(estimatedPositionMs,
+                                     std::numeric_limits<int>::max())));
+}
+
+void MainWindow::updateLyricsHighlight()
+{
+    if (!lyricsViewOpen_ || !lyricsList_ || lyricsList_->count() == 0
+        || lyricLineStartTimesMs_.isEmpty()) {
+        return;
+    }
+    refreshPlaybackPosition();
+    updateLyricsColors(true);
+
+    int activeLine = -1;
+    int latestStartTimeMs = -1;
+    for (int index = 0; index < lyricLineStartTimesMs_.size(); ++index) {
+        const int startTimeMs = lyricLineStartTimesMs_.at(index);
+        if (startTimeMs >= 0 && startTimeMs <= playbackState_.positionMs
+            && startTimeMs >= latestStartTimeMs) {
+            activeLine = index;
+            latestStartTimeMs = startTimeMs;
+        }
+    }
+    if (activeLine == currentLyricLineIndex_) {
+        return;
+    }
+
+    const auto setLineStyle = [this](int index, bool active) {
+        QListWidgetItem *item = lyricsList_->item(index);
+        if (!item) {
+            return;
+        }
+        QFont font = item->font();
+        font.setPointSize(active ? 24 : 20);
+        font.setWeight(active ? QFont::Bold : QFont::DemiBold);
+        item->setFont(font);
+    };
+
+    if (currentLyricLineIndex_ >= 0 && currentLyricLineIndex_ < lyricsList_->count()) {
+        setLineStyle(currentLyricLineIndex_, false);
+    }
+    currentLyricLineIndex_ = activeLine;
+    if (activeLine >= 0) {
+        setLineStyle(activeLine, true);
+        QScrollBar *scrollBar = lyricsList_->verticalScrollBar();
+        const int currentScrollPosition = scrollBar->value();
+        lyricsList_->scrollToItem(lyricsList_->item(activeLine),
+                                  QAbstractItemView::PositionAtCenter);
+        const int targetScrollPosition = scrollBar->value();
+        scrollBar->setValue(currentScrollPosition);
+        if (targetScrollPosition != currentScrollPosition) {
+            lyricsScrollAnimation_->stop();
+            lyricsScrollAnimation_->setStartValue(currentScrollPosition);
+            lyricsScrollAnimation_->setEndValue(targetScrollPosition);
+            lyricsScrollAnimation_->start();
+        }
+    } else if (currentLyricLineIndex_ < 0) {
+        if (lyricsList_->verticalScrollBar()->value() != 0) {
+            lyricsScrollAnimation_->stop();
+            lyricsScrollAnimation_->setStartValue(lyricsList_->verticalScrollBar()->value());
+            lyricsScrollAnimation_->setEndValue(0);
+            lyricsScrollAnimation_->start();
+        }
+    }
+}
+
 void MainWindow::updatePlaybackProgress()
 {
     if (!playbackState_.active || playbackState_.paused) {
         playbackProgressTimer_->stop();
+        updateLyricsHighlight();
         return;
     }
-    playbackState_.positionMs = qMin(playbackState_.durationMs,
-                                     playbackState_.positionMs + playbackProgressTimer_->interval());
+    refreshPlaybackPosition();
     if (!playbackProgressSlider_->isSliderDown()) {
         playbackProgressSlider_->setValue(playbackState_.positionMs);
         playbackPositionLabel_->setText(formatPlaybackTime(playbackState_.positionMs));
@@ -7266,4 +7766,5 @@ void MainWindow::updatePlaybackProgress()
     if (playbackState_.durationMs > 0 && playbackState_.positionMs >= playbackState_.durationMs) {
         playbackProgressTimer_->stop();
     }
+    updateLyricsHighlight();
 }

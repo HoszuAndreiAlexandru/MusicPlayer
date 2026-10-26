@@ -83,6 +83,13 @@ struct SpotifyPlaybackState
     bool supportsVolume = false;
 };
 
+struct TrackLyrics
+{
+    QString plainLyrics;
+    QString syncedLyrics;
+    bool instrumental = false;
+};
+
 struct SpotifyDeviceResult
 {
     QString id;
@@ -147,6 +154,7 @@ public:
     using ArtistAlbumsHandler = std::function<void(const QList<SpotifyAlbumProfile> &, int, int,
                                                    bool, const QString &)>;
     using AlbumProfileHandler = std::function<void(const SpotifyAlbumProfile &, const QString &)>;
+    using LyricsHandler = std::function<void(const TrackLyrics &, const QString &)>;
 
     explicit SpotifyConnection(QObject *parent = nullptr);
     ~SpotifyConnection() override;
@@ -162,7 +170,7 @@ public:
     bool isConnected() const;
     void invalidateLibraryCache();
     void playTracks(const QStringList &trackUris, const QString &contextUri = {},
-                    const QString &offsetUri = {});
+                    const QString &offsetUri = {}, int positionMs = -1);
     void pausePlayback();
     void resumePlayback();
     void nextTrack();
@@ -185,6 +193,9 @@ public:
     void fetchAlbumProfile(const QString &albumId, AlbumProfileHandler handler);
     void fetchAlbumTracks(const QString &albumId, int offset, TracksPageHandler handler);
     void requestImage(const QString &imageUrl, ImageHandler handler);
+    void fetchTrackLyrics(const QString &trackUri, const QString &trackName,
+                         const QString &artistName,
+                         const QString &albumName, int durationMs, LyricsHandler handler);
     void setImageCacheMaxSizeMb(int megabytes);
     QString availableDevicesError() const;
     QString currentUserDisplayName() const;
@@ -198,6 +209,13 @@ private:
         int total = 0;
         qint64 expiresAtMs = 0;
         qint64 retryAfterMs = 0;
+    };
+    struct CachedLyrics
+    {
+        TrackLyrics lyrics;
+        QString errorMessage;
+        qint64 cachedAtMs = 0;
+        qint64 expiresAtMs = 0;
     };
 
     void handleIncomingConnection();
@@ -230,6 +248,9 @@ private:
                               qint64 *expiresAtMs) const;
     void saveMetadataToDisk(const QString &cacheKey, const QJsonObject &value,
                             qint64 lifetimeMs) const;
+    QString lyricsCachePath() const;
+    void loadLyricsCache();
+    void saveLyricsCache();
     void clearApiCache();
     QString imageCachePath(const QString &imageUrl) const;
     bool loadImageFromDisk(const QString &imageUrl, QImage *image, qint64 *expiresAtMs);
@@ -277,9 +298,11 @@ private:
     QList<std::function<void()>> devicesRefreshCallbacks_;
     QString pendingPlaybackContextUri_;
     QString pendingPlaybackOffsetUri_;
+    int pendingPlaybackPositionMs_ = -1;
     QByteArray accessToken_;
     QByteArray refreshToken_;
     QHash<QString, CachedTrackPage> trackPageCache_;
+    QHash<QString, CachedLyrics> lyricsCache_;
     struct CachedImage
     {
         QImage image;
