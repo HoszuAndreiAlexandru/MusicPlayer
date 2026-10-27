@@ -20,6 +20,9 @@ target_link_libraries(MusicPlayer PRIVATE Qt6::Network Qt6::Widgets)
 
 if(WIN32)
     target_link_libraries(MusicPlayer PRIVATE Crypt32)
+elseif(APPLE)
+    find_library(SECURITY_FRAMEWORK Security REQUIRED)
+    target_link_libraries(MusicPlayer PRIVATE "${SECURITY_FRAMEWORK}")
 endif()
 
 set_target_properties(MusicPlayer PROPERTIES

@@ -43,6 +43,10 @@
 #include <wincrypt.h>
 #endif
 
+#ifdef Q_OS_MACOS
+#include <Security/Security.h>
+#endif
+
 namespace {
 
 constexpr qint64 spotifyImageCacheLifetimeMs = 365LL * 24 * 60 * 60 * 1000;
@@ -59,6 +63,115 @@ constexpr int spotifyImageRequestTimeoutMs = 30000;
 constexpr int playbackStartupTimeoutMs = 25000;
 QMutex spotifyImageCacheWriteMutex;
 qint64 spotifyImageCacheDiskBytes = -1;
+
+#ifdef Q_OS_MACOS
+CFMutableDictionaryRef spotifyKeychainSessionQuery(bool returnData = false)
+{
+    CFMutableDictionaryRef query = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+    if (!query) {
+        return nullptr;
+    }
+    CFDictionarySetValue(query, kSecClass, kSecClassGenericPassword);
+    CFDictionarySetValue(query, kSecAttrService, CFSTR("com.musicplayer.spotify-session"));
+    CFDictionarySetValue(query, kSecAttrAccount, CFSTR("desktop-session"));
+    if (returnData) {
+        CFDictionarySetValue(query, kSecReturnData, kCFBooleanTrue);
+        CFDictionarySetValue(query, kSecMatchLimit, kSecMatchLimitOne);
+    }
+    return query;
+}
+
+QString keychainErrorText(const QString &action, OSStatus status)
+{
+    CFStringRef description = SecCopyErrorMessageString(status, nullptr);
+    QString detail;
+    if (description) {
+        const CFIndex capacity = CFStringGetMaximumSizeForEncoding(
+                                     CFStringGetLength(description), kCFStringEncodingUTF8) + 1;
+        QByteArray buffer(static_cast<qsizetype>(capacity), '\0');
+        if (CFStringGetCString(description, buffer.data(), capacity, kCFStringEncodingUTF8)) {
+            detail = QString::fromUtf8(buffer.constData());
+        }
+        CFRelease(description);
+    }
+    return detail.isEmpty()
+        ? QStringLiteral("macOS Keychain could not %1 the Spotify session (error %2).")
+              .arg(action).arg(static_cast<int>(status))
+        : QStringLiteral("macOS Keychain could not %1 the Spotify session: %2")
+              .arg(action, detail);
+}
+
+OSStatus saveSpotifySessionToKeychain(const QByteArray &sessionData)
+{
+    CFMutableDictionaryRef query = spotifyKeychainSessionQuery();
+    if (!query) {
+        return errSecAllocate;
+    }
+    CFDataRef data = CFDataCreate(kCFAllocatorDefault,
+                                  reinterpret_cast<const UInt8 *>(sessionData.constData()),
+                                  static_cast<CFIndex>(sessionData.size()));
+    if (!data) {
+        CFRelease(query);
+        return errSecAllocate;
+    }
+
+    CFDictionarySetValue(query, kSecValueData, data);
+    OSStatus status = SecItemAdd(query, nullptr);
+    if (status == errSecDuplicateItem) {
+        CFMutableDictionaryRef attributes = CFDictionaryCreateMutable(
+            kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks);
+        if (!attributes) {
+            status = errSecAllocate;
+        } else {
+            CFDictionarySetValue(attributes, kSecValueData, data);
+            CFMutableDictionaryRef match = spotifyKeychainSessionQuery();
+            status = match ? SecItemUpdate(match, attributes) : errSecAllocate;
+            if (match) CFRelease(match);
+            CFRelease(attributes);
+        }
+    }
+
+    CFRelease(data);
+    CFRelease(query);
+    return status;
+}
+
+OSStatus loadSpotifySessionFromKeychain(QByteArray *sessionData)
+{
+    CFMutableDictionaryRef query = spotifyKeychainSessionQuery(true);
+    if (!query) {
+        return errSecAllocate;
+    }
+    CFTypeRef result = nullptr;
+    const OSStatus status = SecItemCopyMatching(query, &result);
+    CFRelease(query);
+    if (status != errSecSuccess) {
+        return status;
+    }
+
+    if (result && CFGetTypeID(result) == CFDataGetTypeID()) {
+        const CFDataRef data = static_cast<CFDataRef>(result);
+        *sessionData = QByteArray(reinterpret_cast<const char *>(CFDataGetBytePtr(data)),
+                                  static_cast<qsizetype>(CFDataGetLength(data)));
+    }
+    if (result) CFRelease(result);
+    return sessionData->isEmpty() ? errSecDecode : errSecSuccess;
+}
+
+OSStatus deleteSpotifySessionFromKeychain()
+{
+    CFMutableDictionaryRef query = spotifyKeychainSessionQuery();
+    if (!query) {
+        return errSecAllocate;
+    }
+    const OSStatus status = SecItemDelete(query);
+    CFRelease(query);
+    return status == errSecItemNotFound ? errSecSuccess : status;
+}
+#endif
 
 void setRequestTimeout(QNetworkRequest &request, int timeoutMs = spotifyRequestTimeoutMs)
 {
@@ -1187,6 +1300,27 @@ bool SpotifyConnection::saveSession(QString *errorMessage) const
         return false;
     }
     return true;
+#elif defined(Q_OS_MACOS)
+    if (refreshToken_.isEmpty() || clientId_.isEmpty()) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Spotify did not provide a refresh token to save.");
+        }
+        return false;
+    }
+
+    QJsonObject session;
+    session.insert(QStringLiteral("version"), 1);
+    session.insert(QStringLiteral("client_id"), clientId_);
+    session.insert(QStringLiteral("refresh_token"), QString::fromUtf8(refreshToken_));
+    const OSStatus status = saveSpotifySessionToKeychain(
+        QJsonDocument(session).toJson(QJsonDocument::Compact));
+    if (status != errSecSuccess) {
+        if (errorMessage) {
+            *errorMessage = keychainErrorText(QStringLiteral("save"), status);
+        }
+        return false;
+    }
+    return true;
 #else
     Q_UNUSED(errorMessage);
     return false;
@@ -1238,6 +1372,33 @@ QString SpotifyConnection::restoreSession()
     if (refreshToken_.isEmpty()) {
         if (errorHandler_) {
             errorHandler_(QStringLiteral("The saved Spotify session has no refresh token. Connect Spotify again."));
+        }
+        return {};
+    }
+
+    clientId_ = storedClientId;
+    refreshAccessToken();
+    return clientId_;
+#elif defined(Q_OS_MACOS)
+    QByteArray sessionData;
+    const OSStatus status = loadSpotifySessionFromKeychain(&sessionData);
+    if (status == errSecItemNotFound) {
+        return {};
+    }
+    if (status != errSecSuccess) {
+        if (errorHandler_) {
+            errorHandler_(keychainErrorText(QStringLiteral("read"), status));
+        }
+        return {};
+    }
+
+    const QJsonObject session = QJsonDocument::fromJson(sessionData).object();
+    const QString storedClientId = session.value(QStringLiteral("client_id")).toString().trimmed();
+    refreshToken_ = session.value(QStringLiteral("refresh_token")).toString().toUtf8();
+    if (storedClientId.isEmpty() || refreshToken_.isEmpty()) {
+        refreshToken_.clear();
+        if (errorHandler_) {
+            errorHandler_(QStringLiteral("The saved macOS Keychain session is incomplete. Connect Spotify again."));
         }
         return {};
     }
@@ -1340,6 +1501,12 @@ void SpotifyConnection::disconnectAccount()
     if (QFile::exists(sessionFilePath()) && !QFile::remove(sessionFilePath()) && errorHandler_) {
         errorHandler_(QStringLiteral("Spotify was disconnected, but its saved AppData session could not be removed."));
     }
+#ifdef Q_OS_MACOS
+    const OSStatus keychainStatus = deleteSpotifySessionFromKeychain();
+    if (keychainStatus != errSecSuccess && errorHandler_) {
+        errorHandler_(keychainErrorText(QStringLiteral("remove"), keychainStatus));
+    }
+#endif
     setState("Spotify not connected", false, false);
 }
 

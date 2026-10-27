@@ -1980,7 +1980,10 @@ void configureTrackTable(QTableView *table)
     table->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     table->verticalHeader()->setVisible(false);
     table->verticalHeader()->setDefaultSectionSize(54);
+    table->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+#ifndef Q_OS_MACOS
     new SmoothWheelScrollFilter(table, 54);
+#endif
     table->horizontalHeader()->setHighlightSections(false);
     table->horizontalHeader()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
     table->horizontalHeader()->setSectionsClickable(true);
@@ -5897,6 +5900,27 @@ void MainWindow::processNextLibraryPage()
             return;
         }
 
+        const bool sortWasPending = libraryTracksModel_->sortPending();
+        const bool restoreLibraryViewportAfterSort = sortWasPending
+            && !restoreLibraryScrollPending_
+            && pendingLibraryFocusTrackUri_.isEmpty()
+            && pageStack_->currentIndex() == libraryPageIndex;
+        const int previousScrollPosition = libraryTracksTable_->verticalScrollBar()->value();
+        QString scrollAnchorUri;
+        int scrollAnchorRow = -1;
+        int scrollAnchorTop = 0;
+        if (restoreLibraryViewportAfterSort) {
+            const int topVisibleRow = libraryTracksTable_->rowAt(0);
+            const SpotifyTrackResult *anchorTrack = topVisibleRow >= 0
+                ? libraryTracksModel_->trackAt(topVisibleRow) : nullptr;
+            if (anchorTrack) {
+                scrollAnchorUri = anchorTrack->spotifyUri;
+                scrollAnchorRow = topVisibleRow;
+                scrollAnchorTop = libraryTracksTable_->visualRect(
+                    libraryTracksModel_->index(topVisibleRow, trackTitleColumn)).top();
+            }
+        }
+
         activeLibraryPageOffset_ = -1;
         if (!error.isEmpty()) {
             if (tracks.isEmpty()) {
@@ -5935,6 +5959,7 @@ void MainWindow::processNextLibraryPage()
         }
         libraryTracksModel_->setTotalRows(libraryTotalTracks_);
         libraryTracksModel_->setTracks(offset, tracks);
+        const bool sortJustCompleted = sortWasPending && !libraryTracksModel_->sortPending();
         tryFocusPlaybackTrack();
         updateLibraryArtwork();
         updateTrackTablePlaybackState(libraryTracksModel_);
@@ -5945,6 +5970,29 @@ void MainWindow::processNextLibraryPage()
             const int scrollPosition = savedLibraryScrollPosition_;
             QTimer::singleShot(0, this, [this, scrollPosition] {
                 libraryTracksTable_->verticalScrollBar()->setValue(scrollPosition);
+            });
+        }
+        if (sortJustCompleted && restoreLibraryViewportAfterSort) {
+            QTimer::singleShot(0, this,
+                [this, scrollAnchorUri, scrollAnchorRow, scrollAnchorTop,
+                 previousScrollPosition] {
+                QScrollBar *scrollBar = libraryTracksTable_->verticalScrollBar();
+                if (!scrollAnchorUri.isEmpty()) {
+                    const int row = libraryTracksModel_->rowForUri(scrollAnchorUri,
+                                                                    scrollAnchorRow);
+                    if (row >= 0) {
+                        const QModelIndex anchorIndex = libraryTracksModel_->index(
+                            row, trackTitleColumn);
+                        libraryTracksTable_->scrollTo(anchorIndex,
+                                                      QAbstractItemView::PositionAtTop);
+                        scrollBar->setValue(qBound(scrollBar->minimum(),
+                                                   scrollBar->value() - scrollAnchorTop,
+                                                   scrollBar->maximum()));
+                        return;
+                    }
+                }
+                scrollBar->setValue(qBound(scrollBar->minimum(), previousScrollPosition,
+                                           scrollBar->maximum()));
             });
         }
         for (auto it = cachedLibraryPageOffsets_.begin(); it != cachedLibraryPageOffsets_.end();) {
