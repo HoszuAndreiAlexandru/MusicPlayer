@@ -1059,12 +1059,14 @@ void SpotifyConnection::notifyDevicesUpdated()
 }
 
 void SpotifyConnection::playTracks(const QStringList &trackUris, const QString &contextUri,
-                                   const QString &offsetUri, int positionMs)
+                                   const QString &offsetUri, int positionMs,
+                                   std::function<void(bool)> completion)
 {
     if (!connected_ || accessToken_.isEmpty()) {
         if (playbackStatusHandler_) {
             playbackStatusHandler_(QStringLiteral("Connect Spotify before starting playback."));
         }
+        if (completion) completion(false);
         return;
     }
     const bool hasContext = !contextUri.isEmpty();
@@ -1074,6 +1076,7 @@ void SpotifyConnection::playTracks(const QStringList &trackUris, const QString &
         if (playbackStatusHandler_) {
             playbackStatusHandler_(QStringLiteral("Spotify did not provide a playable track or playlist."));
         }
+        if (completion) completion(false);
         return;
     }
     for (const QString &uri : trackUris) {
@@ -1082,16 +1085,46 @@ void SpotifyConnection::playTracks(const QStringList &trackUris, const QString &
             if (playbackStatusHandler_) {
                 playbackStatusHandler_(QStringLiteral("A selected item is not a playable Spotify track or episode."));
             }
+            if (completion) completion(false);
             return;
         }
     }
 
+    if (pendingPlaybackCompletion_) {
+        auto previousCompletion = std::move(pendingPlaybackCompletion_);
+        previousCompletion(false);
+    }
     pendingPlaybackUris_ = trackUris;
     pendingPlaybackContextUri_ = contextUri;
     pendingPlaybackOffsetUri_ = offsetUri;
     pendingPlaybackPositionMs_ = positionMs >= 0 ? positionMs : -1;
+    pendingPlaybackCompletion_ = std::move(completion);
     startPlaybackCompanion();
     maybeStartPendingPlayback();
+}
+
+void SpotifyConnection::queuePlaybackTrack(const QString &trackUri,
+                                           std::function<void(bool)> completion)
+{
+    if (!trackUri.startsWith(QStringLiteral("spotify:track:"))
+        && !trackUri.startsWith(QStringLiteral("spotify:episode:"))) {
+        if (playbackStatusHandler_) {
+            playbackStatusHandler_(QStringLiteral("Spotify could not queue an invalid track."));
+        }
+        if (completion) completion(false);
+        return;
+    }
+
+    QUrl url(QStringLiteral("https://api.spotify.com/v1/me/player/queue"));
+    QUrlQuery query;
+    query.addQueryItem(QStringLiteral("uri"), trackUri);
+    const QString targetDeviceId = !playbackDeviceId_.isEmpty()
+        ? playbackDeviceId_ : playbackState_.deviceId;
+    if (!targetDeviceId.isEmpty()) {
+        query.addQueryItem(QStringLiteral("device_id"), targetDeviceId);
+    }
+    url.setQuery(query);
+    sendPlayerCommand(QByteArrayLiteral("POST"), url, {}, std::move(completion));
 }
 
 void SpotifyConnection::pausePlayback()
@@ -1480,6 +1513,10 @@ void SpotifyConnection::disconnectAccount()
     playbackKey_.clear();
     playbackDeviceId_.clear();
     pendingPlaybackUris_.clear();
+    if (pendingPlaybackCompletion_) {
+        auto completion = std::move(pendingPlaybackCompletion_);
+        completion(false);
+    }
     pendingPlaybackContextUri_.clear();
     pendingPlaybackOffsetUri_.clear();
     pendingPlaybackPositionMs_ = -1;
@@ -3428,12 +3465,14 @@ void SpotifyConnection::maybeStartPendingPlayback()
     pendingPlaybackContextUri_.clear();
     pendingPlaybackOffsetUri_.clear();
     pendingPlaybackPositionMs_ = -1;
+    auto completion = std::move(pendingPlaybackCompletion_);
     QUrl url(QStringLiteral("https://api.spotify.com/v1/me/player/play"));
     QUrlQuery query;
     query.addQueryItem(QStringLiteral("device_id"), playbackDeviceId_);
     url.setQuery(query);
     sendPlayerCommand(QByteArrayLiteral("PUT"), url,
-                      QJsonDocument(body).toJson(QJsonDocument::Compact));
+                      QJsonDocument(body).toJson(QJsonDocument::Compact),
+                      std::move(completion));
 }
 
 void SpotifyConnection::queueLocalPlaybackCommand(const QString &name, int value)
@@ -3468,18 +3507,21 @@ void SpotifyConnection::queueLocalPlaybackCommand(const QString &name, int value
 }
 
 void SpotifyConnection::sendPlayerCommand(const QByteArray &method, const QUrl &url,
-                                          const QByteArray &body)
+                                          const QByteArray &body,
+                                          std::function<void(bool)> completion)
 {
     if (!connected_ || accessToken_.isEmpty()) {
         if (playbackStatusHandler_) {
             playbackStatusHandler_(QStringLiteral("Connect Spotify before controlling playback."));
         }
+        if (completion) completion(false);
         return;
     }
     if (apiRateLimitActive()) {
         if (playbackStatusHandler_) {
             playbackStatusHandler_(apiRateLimitMessage());
         }
+        if (completion) completion(false);
         return;
     }
 
@@ -3491,11 +3533,13 @@ void SpotifyConnection::sendPlayerCommand(const QByteArray &method, const QUrl &
         ? networkManager_->post(request, body)
         : networkManager_->put(request, body);
     observeApiReply(reply);
-    connect(reply, &QNetworkReply::finished, this, [this, reply] {
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, completion = std::move(completion)]() mutable {
         const int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         const QJsonObject response = QJsonDocument::fromJson(reply->readAll()).object();
         if (reply->error() == QNetworkReply::NoError && statusCode >= 200 && statusCode < 300) {
             reply->deleteLater();
+            if (completion) completion(true);
             return;
         }
 
@@ -3522,6 +3566,7 @@ void SpotifyConnection::sendPlayerCommand(const QByteArray &method, const QUrl &
         if (playbackStatusHandler_) {
             playbackStatusHandler_(message);
         }
+        if (completion) completion(false);
     });
 }
 

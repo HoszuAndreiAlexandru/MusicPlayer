@@ -102,6 +102,10 @@ private:
     QString selectedTrackUri() const;
     void playSelectedTrack();
     void skipTrackInCurrentList(int direction);
+    void startLikedSongsPlaybackAtRow(int row);
+    void stopLikedSongsPlayback();
+    void updateLikedSongsPlaybackQueue(const SpotifyPlaybackState &state);
+    void queueNextLikedSongsTrack();
     void openArtistById(const QString &artistId, const QString &artistName = {});
     void focusPlaybackSource();
     void tryFocusPlaybackTrack();
@@ -228,6 +232,9 @@ private:
     QString pendingAlbumFocusTrackUri_;
     QString playbackRepeatModeOverride_;
     QString pendingTransportTrackUri_;
+    QVector<QString> likedSongsQueueUris_;
+    QString likedSongsQueueCurrentUri_;
+    QString likedSongsQueueQueuedUri_;
     QString displayedProfileArtworkUrl_;
     QString displayedHeaderAvatarUrl_;
     QString displayedPanelArtworkUrl_;
@@ -248,6 +255,10 @@ private:
     QElapsedTimer playbackPositionClock_;
     int pendingTransportTrackRow_ = -1;
     int pendingTransportPage_ = -1;
+    int likedSongsQueueCurrentIndex_ = -1;
+    int likedSongsQueueQueuedIndex_ = -1;
+    int likedSongsQueueNextFetchOffset_ = -1;
+    int likedSongsQueueTotalTracks_ = 0;
     qint64 pendingTransportUntilMs_ = 0;
     bool playbackUiCommandPending_ = false;
     bool playbackUiRequestedPaused_ = true;
@@ -258,6 +269,7 @@ private:
     int lastPlaybackSelectionPage_ = -1;
     quint64 searchRequestId_ = 0;
     quint64 libraryRequestId_ = 0;
+    quint64 likedSongsQueueGeneration_ = 0;
     quint64 playlistRequestId_ = 0;
     quint64 playbackArtworkRequestId_ = 0;
     quint64 panelArtworkRequestId_ = 0;
@@ -298,6 +310,11 @@ private:
     bool albumTrackRequestActive_ = false;
     bool restoreAlbumScrollPending_ = false;
     bool restoredPlaybackPending_ = false;
+    bool likedSongsQueueActive_ = false;
+    bool likedSongsQueuePlayCommandPending_ = false;
+    bool likedSongsQueueFetchInFlight_ = false;
+    bool likedSongsQueueRequestInFlight_ = false;
+    bool likedSongsQueueAwaitingStart_ = false;
     bool lyricsViewOpen_ = false;
     bool lyricsRequestInFlight_ = false;
     bool lyricsLoaded_ = false;

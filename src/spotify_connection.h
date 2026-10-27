@@ -171,7 +171,10 @@ public:
     bool isConnected() const;
     void invalidateLibraryCache();
     void playTracks(const QStringList &trackUris, const QString &contextUri = {},
-                    const QString &offsetUri = {}, int positionMs = -1);
+                    const QString &offsetUri = {}, int positionMs = -1,
+                    std::function<void(bool)> completion = {});
+    void queuePlaybackTrack(const QString &trackUri,
+                            std::function<void(bool)> completion = {});
     void pausePlayback();
     void resumePlayback();
     void nextTrack();
@@ -272,7 +275,8 @@ private:
     void notifyDevicesUpdated();
     void maybeStartPendingPlayback();
     void queueLocalPlaybackCommand(const QString &command, int value = -1);
-    void sendPlayerCommand(const QByteArray &method, const QUrl &url, const QByteArray &body);
+    void sendPlayerCommand(const QByteArray &method, const QUrl &url, const QByteArray &body,
+                           std::function<void(bool)> completion = {});
     void notifyPlaybackState();
     bool saveSession(QString *errorMessage = nullptr) const;
     QString sessionFilePath() const;
@@ -299,6 +303,7 @@ private:
     QString playbackBrowserProfilePath_;
     void *playbackBrowserJob_ = nullptr;
     QStringList pendingPlaybackUris_;
+    std::function<void(bool)> pendingPlaybackCompletion_;
     QList<QJsonObject> pendingPlaybackCommands_;
     QList<SpotifyDeviceResult> availableDevices_;
     QString availableDevicesError_;

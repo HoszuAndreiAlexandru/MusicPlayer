@@ -823,6 +823,25 @@ protected:
     bool eventFilter(QObject *watched, QEvent *event) override
     {
         if (!area_) return false;
+#ifdef Q_OS_MACOS
+        if (watched == area_->viewport() && event->type() == QEvent::Wheel) {
+            auto *wheelEvent = static_cast<QWheelEvent *>(event);
+            QScrollBar *scrollBar = area_->verticalScrollBar();
+            const int pixelDelta = wheelEvent->pixelDelta().y();
+            const int angleDelta = wheelEvent->angleDelta().y();
+            const int movement = pixelDelta != 0
+                ? pixelDelta
+                : qRound(static_cast<double>(angleDelta) * scrollBar->singleStep() * 3.0 / 120.0);
+            const int currentValue = scrollBar->value();
+            const int targetValue = qBound(scrollBar->minimum(), currentValue - movement,
+                                           scrollBar->maximum());
+            if (targetValue != currentValue) {
+                scrollBar->setValue(targetValue);
+                wheelEvent->accept();
+                return true;
+            }
+        }
+#endif
         if (event->type() == QEvent::Enter) {
             setHovered(true);
         } else if (event->type() == QEvent::Leave) {
@@ -5104,6 +5123,9 @@ void MainWindow::closeEvent(QCloseEvent *event)
 
 void MainWindow::updateSpotifyConnectionUi(const QString &message, bool connected, bool busy)
 {
+    if (!connected && likedSongsQueueActive_) {
+        stopLikedSongsPlayback();
+    }
     if (startupWindowPending_ && !connected && !busy) {
         showStartupWindow();
     }
@@ -5900,24 +5922,31 @@ void MainWindow::processNextLibraryPage()
             return;
         }
 
-        const bool sortWasPending = libraryTracksModel_->sortPending();
-        const bool restoreLibraryViewportAfterSort = sortWasPending
-            && !restoreLibraryScrollPending_
+        const bool restoreLibraryViewport = !restoreLibraryScrollPending_
             && pendingLibraryFocusTrackUri_.isEmpty()
             && pageStack_->currentIndex() == libraryPageIndex;
         const int previousScrollPosition = libraryTracksTable_->verticalScrollBar()->value();
         QString scrollAnchorUri;
         int scrollAnchorRow = -1;
         int scrollAnchorTop = 0;
-        if (restoreLibraryViewportAfterSort) {
-            const int topVisibleRow = libraryTracksTable_->rowAt(0);
-            const SpotifyTrackResult *anchorTrack = topVisibleRow >= 0
-                ? libraryTracksModel_->trackAt(topVisibleRow) : nullptr;
-            if (anchorTrack) {
-                scrollAnchorUri = anchorTrack->spotifyUri;
-                scrollAnchorRow = topVisibleRow;
-                scrollAnchorTop = libraryTracksTable_->visualRect(
-                    libraryTracksModel_->index(topVisibleRow, trackTitleColumn)).top();
+        if (restoreLibraryViewport) {
+            int viewportY = 0;
+            while (viewportY < libraryTracksTable_->viewport()->height()) {
+                const int visibleRow = libraryTracksTable_->rowAt(viewportY);
+                if (visibleRow < 0) {
+                    break;
+                }
+                const QRect visibleRect = libraryTracksTable_->visualRect(
+                    libraryTracksModel_->index(visibleRow, trackTitleColumn));
+                const SpotifyTrackResult *anchorTrack =
+                    libraryTracksModel_->trackAt(visibleRow);
+                if (anchorTrack) {
+                    scrollAnchorUri = anchorTrack->spotifyUri;
+                    scrollAnchorRow = visibleRow;
+                    scrollAnchorTop = visibleRect.top();
+                    break;
+                }
+                viewportY = qMax(viewportY + 1, visibleRect.bottom() + 1);
             }
         }
 
@@ -5959,7 +5988,6 @@ void MainWindow::processNextLibraryPage()
         }
         libraryTracksModel_->setTotalRows(libraryTotalTracks_);
         libraryTracksModel_->setTracks(offset, tracks);
-        const bool sortJustCompleted = sortWasPending && !libraryTracksModel_->sortPending();
         tryFocusPlaybackTrack();
         updateLibraryArtwork();
         updateTrackTablePlaybackState(libraryTracksModel_);
@@ -5972,27 +6000,36 @@ void MainWindow::processNextLibraryPage()
                 libraryTracksTable_->verticalScrollBar()->setValue(scrollPosition);
             });
         }
-        if (sortJustCompleted && restoreLibraryViewportAfterSort) {
+        if (restoreLibraryViewport) {
             QTimer::singleShot(0, this,
                 [this, scrollAnchorUri, scrollAnchorRow, scrollAnchorTop,
                  previousScrollPosition] {
-                QScrollBar *scrollBar = libraryTracksTable_->verticalScrollBar();
-                if (!scrollAnchorUri.isEmpty()) {
-                    const int row = libraryTracksModel_->rowForUri(scrollAnchorUri,
-                                                                    scrollAnchorRow);
-                    if (row >= 0) {
-                        const QModelIndex anchorIndex = libraryTracksModel_->index(
-                            row, trackTitleColumn);
-                        libraryTracksTable_->scrollTo(anchorIndex,
-                                                      QAbstractItemView::PositionAtTop);
-                        scrollBar->setValue(qBound(scrollBar->minimum(),
-                                                   scrollBar->value() - scrollAnchorTop,
-                                                   scrollBar->maximum()));
+                QTimer::singleShot(0, this,
+                    [this, scrollAnchorUri, scrollAnchorRow, scrollAnchorTop,
+                     previousScrollPosition] {
+                    if (pageStack_->currentIndex() != libraryPageIndex
+                        || restoreLibraryScrollPending_
+                        || !pendingLibraryFocusTrackUri_.isEmpty()) {
                         return;
                     }
-                }
-                scrollBar->setValue(qBound(scrollBar->minimum(), previousScrollPosition,
-                                           scrollBar->maximum()));
+                    QScrollBar *scrollBar = libraryTracksTable_->verticalScrollBar();
+                    if (!scrollAnchorUri.isEmpty()) {
+                        const int row = libraryTracksModel_->rowForUri(scrollAnchorUri,
+                                                                        scrollAnchorRow);
+                        if (row >= 0) {
+                            const QModelIndex anchorIndex = libraryTracksModel_->index(
+                                row, trackTitleColumn);
+                            libraryTracksTable_->scrollTo(anchorIndex,
+                                                          QAbstractItemView::PositionAtTop);
+                            scrollBar->setValue(qBound(scrollBar->minimum(),
+                                                       scrollBar->value() - scrollAnchorTop,
+                                                       scrollBar->maximum()));
+                            return;
+                        }
+                    }
+                    scrollBar->setValue(qBound(scrollBar->minimum(), previousScrollPosition,
+                                               scrollBar->maximum()));
+                });
             });
         }
         for (auto it = cachedLibraryPageOffsets_.begin(); it != cachedLibraryPageOffsets_.end();) {
@@ -6794,16 +6831,25 @@ void MainWindow::playSelectedTrack()
     lastRequestedTrackUri_ = uri;
 
     if (pageStack_->currentIndex() == libraryPageIndex && !activeLibraryPlaylistId_.isEmpty()) {
+        stopLikedSongsPlayback();
         const QString contextUri = QStringLiteral("spotify:playlist:%1").arg(activeLibraryPlaylistId_);
         spotifyConnection_->playTracks({}, contextUri, uri);
         return;
     }
 
     if (pageStack_->currentIndex() == albumPageIndex && !currentAlbumPageId_.isEmpty()) {
+        stopLikedSongsPlayback();
         const QString contextUri = QStringLiteral("spotify:album:%1").arg(currentAlbumPageId_);
         spotifyConnection_->playTracks({}, contextUri, uri);
         return;
     }
+
+    if (pageStack_->currentIndex() == libraryPageIndex && activeLibraryPlaylistId_.isEmpty()) {
+        startLikedSongsPlaybackAtRow(libraryTracksTable_->currentIndex().row());
+        return;
+    }
+
+    stopLikedSongsPlayback();
 
     QTableView *table = pageStack_->currentIndex() == searchPageIndex ? searchResultsTable_
         : pageStack_->currentIndex() == albumPageIndex ? albumTracksTable_
@@ -6822,6 +6868,235 @@ void MainWindow::playSelectedTrack()
         }
     }
     spotifyConnection_->playTracks(queue);
+}
+
+void MainWindow::startLikedSongsPlaybackAtRow(int row)
+{
+    if (!spotifyConnection_ || !libraryTracksModel_ || row < 0) {
+        return;
+    }
+    const SpotifyTrackResult *selectedTrack = libraryTracksModel_->trackAt(row);
+    if (!selectedTrack || !selectedTrack->spotifyUri.startsWith(QStringLiteral("spotify:track:"))) {
+        return;
+    }
+
+    stopLikedSongsPlayback();
+    likedSongsQueueActive_ = true;
+    likedSongsQueueAwaitingStart_ = true;
+    likedSongsQueuePlayCommandPending_ = true;
+    likedSongsQueueCurrentUri_ = selectedTrack->spotifyUri;
+    likedSongsQueueCurrentIndex_ = 0;
+    likedSongsQueueTotalTracks_ = libraryTracksModel_->totalTrackCount();
+
+    const int firstTrackRow = libraryTracksModel_->firstTrackRow();
+    int lastLoadedTrackOffset = row - firstTrackRow;
+    for (int trackRow = row; trackRow < libraryTracksModel_->rowCount(); ++trackRow) {
+        const SpotifyTrackResult *track = libraryTracksModel_->trackAt(trackRow);
+        if (!track) {
+            break;
+        }
+        if (track->spotifyUri.startsWith(QStringLiteral("spotify:track:"))) {
+            likedSongsQueueUris_.append(track->spotifyUri);
+            lastLoadedTrackOffset = trackRow - firstTrackRow;
+        }
+    }
+
+    const bool allTracksLoaded = libraryTracksModel_->loadedTrackCount()
+        >= libraryTracksModel_->totalTrackCount();
+    if (allTracksLoaded) {
+        likedSongsQueueNextFetchOffset_ = likedSongsQueueTotalTracks_;
+    } else {
+        constexpr int spotifyPageSize = 50;
+        likedSongsQueueNextFetchOffset_ = qMin(
+            likedSongsQueueTotalTracks_,
+            ((lastLoadedTrackOffset / spotifyPageSize) + 1) * spotifyPageSize);
+    }
+
+    const quint64 generation = likedSongsQueueGeneration_;
+    const QString trackUri = likedSongsQueueCurrentUri_;
+    spotifyConnection_->playTracks({trackUri}, {}, {}, -1,
+        [this, generation](bool success) {
+            if (!likedSongsQueueActive_ || generation != likedSongsQueueGeneration_) {
+                return;
+            }
+            likedSongsQueuePlayCommandPending_ = false;
+            if (!success) {
+                stopLikedSongsPlayback();
+                return;
+            }
+            updateLikedSongsPlaybackQueue(playbackState_);
+        });
+}
+
+void MainWindow::stopLikedSongsPlayback()
+{
+    ++likedSongsQueueGeneration_;
+    likedSongsQueueActive_ = false;
+    likedSongsQueuePlayCommandPending_ = false;
+    likedSongsQueueFetchInFlight_ = false;
+    likedSongsQueueRequestInFlight_ = false;
+    likedSongsQueueAwaitingStart_ = false;
+    likedSongsQueueUris_.clear();
+    likedSongsQueueCurrentUri_.clear();
+    likedSongsQueueQueuedUri_.clear();
+    likedSongsQueueCurrentIndex_ = -1;
+    likedSongsQueueQueuedIndex_ = -1;
+    likedSongsQueueNextFetchOffset_ = -1;
+    likedSongsQueueTotalTracks_ = 0;
+}
+
+void MainWindow::updateLikedSongsPlaybackQueue(const SpotifyPlaybackState &state)
+{
+    if (!likedSongsQueueActive_) {
+        return;
+    }
+    if (state.externalDevice) {
+        if (!likedSongsQueueAwaitingStart_) {
+            stopLikedSongsPlayback();
+        }
+        return;
+    }
+    if (!state.active || state.trackUri.isEmpty()) {
+        return;
+    }
+    if (likedSongsQueuePlayCommandPending_) {
+        return;
+    }
+    if (likedSongsQueueAwaitingStart_) {
+        if (state.trackUri != likedSongsQueueCurrentUri_) {
+            return;
+        }
+        likedSongsQueueAwaitingStart_ = false;
+    }
+
+    int matchingIndex = -1;
+    if (state.trackUri == likedSongsQueueQueuedUri_ && likedSongsQueueQueuedIndex_ >= 0) {
+        matchingIndex = likedSongsQueueQueuedIndex_;
+    } else if (state.trackUri == likedSongsQueueCurrentUri_) {
+        matchingIndex = likedSongsQueueCurrentIndex_;
+    } else {
+        for (int index = likedSongsQueueCurrentIndex_ + 1;
+             index < likedSongsQueueUris_.size(); ++index) {
+            if (likedSongsQueueUris_.at(index) == state.trackUri) {
+                matchingIndex = index;
+                break;
+            }
+        }
+    }
+    if (matchingIndex < 0) {
+        stopLikedSongsPlayback();
+        return;
+    }
+
+    likedSongsQueueCurrentIndex_ = matchingIndex;
+    likedSongsQueueCurrentUri_ = state.trackUri;
+    if (likedSongsQueueQueuedUri_ == state.trackUri) {
+        likedSongsQueueQueuedUri_.clear();
+        likedSongsQueueQueuedIndex_ = -1;
+    }
+    queueNextLikedSongsTrack();
+}
+
+void MainWindow::queueNextLikedSongsTrack()
+{
+    if (!likedSongsQueueActive_ || likedSongsQueueAwaitingStart_
+        || likedSongsQueuePlayCommandPending_ || likedSongsQueueRequestInFlight_
+        || likedSongsQueueFetchInFlight_ || likedSongsQueueCurrentIndex_ < 0
+        || playbackState_.trackUri != likedSongsQueueCurrentUri_
+        || playbackState_.repeatState == QStringLiteral("track")) {
+        return;
+    }
+
+    const int nextIndex = likedSongsQueueCurrentIndex_ + 1;
+    if (nextIndex >= likedSongsQueueUris_.size()) {
+        if (likedSongsQueueNextFetchOffset_ >= 0
+            && likedSongsQueueNextFetchOffset_ < likedSongsQueueTotalTracks_) {
+            const int offset = likedSongsQueueNextFetchOffset_;
+            const quint64 generation = likedSongsQueueGeneration_;
+            likedSongsQueueFetchInFlight_ = true;
+            spotifyConnection_->fetchSavedTracks(offset,
+                [this, generation, offset](const QList<SpotifyTrackResult> &tracks, int nextOffset,
+                                           int total, const QString &error) {
+                    if (!likedSongsQueueActive_ || generation != likedSongsQueueGeneration_) {
+                        return;
+                    }
+                    likedSongsQueueFetchInFlight_ = false;
+                    if (total >= 0) {
+                        likedSongsQueueTotalTracks_ = total;
+                    }
+                    for (const SpotifyTrackResult &track : tracks) {
+                        if (track.spotifyUri.startsWith(QStringLiteral("spotify:track:"))) {
+                            likedSongsQueueUris_.append(track.spotifyUri);
+                        }
+                    }
+                    if (nextOffset > offset) {
+                        likedSongsQueueNextFetchOffset_ = nextOffset;
+                    } else {
+                        likedSongsQueueNextFetchOffset_ = likedSongsQueueTotalTracks_;
+                    }
+                    if (!error.isEmpty() && tracks.isEmpty()) {
+                        likedSongsQueueNextFetchOffset_ = likedSongsQueueTotalTracks_;
+                        return;
+                    }
+                    queueNextLikedSongsTrack();
+                });
+        } else if (playbackState_.repeatState == QStringLiteral("context")
+                   && !likedSongsQueueUris_.isEmpty()) {
+            const quint64 generation = likedSongsQueueGeneration_;
+            const int currentIndex = likedSongsQueueCurrentIndex_;
+            const QString currentUri = likedSongsQueueCurrentUri_;
+            const QString nextUri = likedSongsQueueUris_.first();
+            likedSongsQueueRequestInFlight_ = true;
+            spotifyConnection_->queuePlaybackTrack(nextUri,
+                [this, generation, currentIndex, currentUri, nextUri](bool success) {
+                    if (!likedSongsQueueActive_ || generation != likedSongsQueueGeneration_) {
+                        return;
+                    }
+                    likedSongsQueueRequestInFlight_ = false;
+                    if (!success) {
+                        stopLikedSongsPlayback();
+                        return;
+                    }
+                    if (likedSongsQueueCurrentIndex_ == currentIndex
+                        && likedSongsQueueCurrentUri_ == currentUri) {
+                        likedSongsQueueQueuedIndex_ = 0;
+                        likedSongsQueueQueuedUri_ = nextUri;
+                    } else {
+                        queueNextLikedSongsTrack();
+                    }
+                });
+        }
+        return;
+    }
+
+    if (likedSongsQueueQueuedIndex_ == nextIndex
+        && likedSongsQueueQueuedUri_ == likedSongsQueueUris_.at(nextIndex)) {
+        return;
+    }
+
+    const quint64 generation = likedSongsQueueGeneration_;
+    const int currentIndex = likedSongsQueueCurrentIndex_;
+    const QString currentUri = likedSongsQueueCurrentUri_;
+    const QString nextUri = likedSongsQueueUris_.at(nextIndex);
+    likedSongsQueueRequestInFlight_ = true;
+    spotifyConnection_->queuePlaybackTrack(nextUri,
+        [this, generation, currentIndex, currentUri, nextIndex, nextUri](bool success) {
+            if (!likedSongsQueueActive_ || generation != likedSongsQueueGeneration_) {
+                return;
+            }
+            likedSongsQueueRequestInFlight_ = false;
+            if (!success) {
+                stopLikedSongsPlayback();
+                return;
+            }
+            if (likedSongsQueueCurrentIndex_ == currentIndex
+                && likedSongsQueueCurrentUri_ == currentUri) {
+                likedSongsQueueQueuedIndex_ = nextIndex;
+                likedSongsQueueQueuedUri_ = nextUri;
+            } else {
+                queueNextLikedSongsTrack();
+            }
+        });
 }
 
 void MainWindow::skipTrackInCurrentList(int direction)
@@ -6903,6 +7178,11 @@ void MainWindow::skipTrackInCurrentList(int direction)
         // playlist/album queue intact while making each button click follow
         // the row order currently shown in the table.
         spotifyConnection_->playTracks({}, contextUri, targetUri);
+        return;
+    }
+
+    if (page == libraryPageIndex && activeLibraryPlaylistId_.isEmpty()) {
+        startLikedSongsPlaybackAtRow(targetRow);
         return;
     }
 
@@ -7229,6 +7509,7 @@ void MainWindow::updatePlaybackUi(const SpotifyPlaybackState &state, bool fromSp
         playbackSourceName_ = updatedState.externalDevice
             ? QStringLiteral("Spotify Connect") : QStringLiteral("Spotify");
     }
+    updateLikedSongsPlaybackQueue(updatedState);
     updateNowPlayingPanel(updatedState);
     updateLyricsForPlayback(updatedState);
     if (nowPlayingArtworkLabel_
