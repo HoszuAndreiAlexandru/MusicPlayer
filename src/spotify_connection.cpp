@@ -386,6 +386,22 @@ QString findHeadlessChromium()
     }
     candidates.append(QStringLiteral("chrome.exe"));
     candidates.append(QStringLiteral("msedge.exe"));
+#elif defined(Q_OS_MACOS)
+    const QString homeApplications = QDir::home().filePath(QStringLiteral("Applications"));
+    QStringList candidates{
+        QDir(homeApplications).filePath(
+            QStringLiteral("Google Chrome.app/Contents/MacOS/Google Chrome")),
+        QStringLiteral("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        QDir(homeApplications).filePath(
+            QStringLiteral("Microsoft Edge.app/Contents/MacOS/Microsoft Edge")),
+        QStringLiteral("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+        QDir(homeApplications).filePath(
+            QStringLiteral("Chromium.app/Contents/MacOS/Chromium")),
+        QStringLiteral("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+        QStringLiteral("google-chrome"), QStringLiteral("google-chrome-stable"),
+        QStringLiteral("chromium"), QStringLiteral("chromium-browser"),
+        QStringLiteral("microsoft-edge")
+    };
 #else
     QStringList candidates{
         QStringLiteral("google-chrome"), QStringLiteral("google-chrome-stable"),
